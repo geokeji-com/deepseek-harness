@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/scripts/common.sh"
+
+usage() {
+  sed -n '1,80p' "$PROJECT_ROOT/README.md"
+}
+
+trace_id() {
+  printf '%s-%s\n' "$(date +%s)" "$$"
+}
+
+cmd_status() {
+  remote 'systemctl --user --no-pager --full status dsh-multiuser.service deepseek-harness-user@owner.service deepseek-harness-user@member2.service deepseek-harness-user@member3.service deepseek-harness-user@member4.service 2>&1 | sed -n "1,220p"; printf "\n--- listeners ---\n"; ss -ltnp | grep -E ":(3080|3081|3090|3091|3092|3093)[[:space:]]" || true; printf "\n--- memory ---\n"; free -h'
+}
+
+cmd_sync_source() {
+  local local_path="$PROJECT_ROOT/mirror/deepseek-harness"
+  mkdir -p "$local_path"
+  rsync -az --delete --delete-excluded --human-readable \
+    --exclude-from="$PROJECT_ROOT/filters/source.exclude" \
+    -e "ssh ${SSH_OPTS[*]}" \
+    "$SSH_TARGET:$REMOTE_REPO/" "$local_path/"
+  log_trace job_succeeded info "$(trace_id)" success source_mirror_updated
+}
+
+cmd_skills_sync() {
+  local local_path="$PROJECT_ROOT/mirror/skills-manager-backup"
+  local remote_path="$REMOTE_HOME/skills-manager-backup"
+  if [[ ! -d "$local_path/.git" ]]; then
+    if [[ -e "$local_path" ]]; then
+      printf 'skills mirror path exists but is not a git clone: %s\n' "$local_path" >&2
+      exit 1
+    fi
+    mkdir -p "$(dirname "$local_path")"
+    git clone --depth=1 --branch main --single-branch \
+      https://github.com/nixyme/skills-manager-backup.git "$local_path"
+  else
+    if [[ -n "$(git -C "$local_path" status --porcelain)" ]]; then
+      printf 'skills mirror has local changes: %s\n' "$local_path" >&2
+      exit 1
+    fi
+    git -C "$local_path" pull --ff-only origin main
+  fi
+
+  remote "mkdir -p '$remote_path'"
+  rsync -az --delete --human-readable \
+    --exclude='.DS_Store' \
+    --exclude='.skills-manager/' \
+    --exclude='__pycache__/' \
+    --exclude='.pytest_cache/' \
+    --exclude='node_modules/' \
+    -e "ssh ${SSH_OPTS[*]}" \
+    "$local_path/" "$SSH_TARGET:$remote_path/"
+  remote "'$REMOTE_HOME/bin/dsh-skills-sync' --source '$remote_path'"
+  remote "export XDG_RUNTIME_DIR=/run/user/1000; export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus; for user in owner member2 member3 member4; do systemctl --user try-restart \"deepseek-harness-user@\$user.service\"; done"
+  log_trace job_succeeded info "$(trace_id)" success shared_skills_synced
+}
+
+cmd_sync_pull() {
+  local user="${1:-}" mirror="${2:-}"
+  require_user "$user"
+  local local_path remote_path stamp backup_dir
+  local_path="$(workspace_local_path "$user")"
+  remote_path="$(workspace_remote_path "$user")"
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  backup_dir="$PROJECT_ROOT/.backups/$user/$stamp"
+  mkdir -p "$local_path" "$backup_dir"
+  local args=(-az --human-readable --delete --backup --backup-dir="$backup_dir"
+    --exclude-from="$PROJECT_ROOT/filters/source.exclude"
+    -e "ssh ${SSH_OPTS[*]}")
+  [[ "$mirror" == "--mirror" ]] || args+=(--dry-run)
+  rsync "${args[@]}" "$SSH_TARGET:$remote_path/" "$local_path/"
+  if [[ "$mirror" != "--mirror" ]]; then
+    printf 'Dry-run only. Re-run with --mirror to update %s\n' "$local_path"
+  else
+    log_trace job_succeeded info "$(trace_id)" success workspace_pull_completed
+  fi
+}
+
+cmd_sync_push() {
+  local user="${1:-}" mirror="${2:-}"
+  require_user "$user"
+  local local_path remote_path stamp
+  local_path="$(workspace_local_path "$user")"
+  remote_path="$(workspace_remote_path "$user")"
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  remote "mkdir -p '$remote_path' '$REMOTE_SHARED_ROOT/.backups/$user/$stamp'"
+  local args=(-az --human-readable --update
+    --exclude-from="$PROJECT_ROOT/filters/source.exclude"
+    -e "ssh ${SSH_OPTS[*]}")
+  if [[ "$mirror" == "--mirror" ]]; then
+    args+=(--delete --backup --backup-dir="$REMOTE_SHARED_ROOT/.backups/$user/$stamp")
+  fi
+  [[ "$mirror" == "--mirror" ]] || args+=(--dry-run)
+  rsync "${args[@]}" "$local_path/" "$SSH_TARGET:$remote_path/"
+  if [[ "$mirror" != "--mirror" ]]; then
+    printf 'Dry-run only. Re-run with --mirror to update the server.\n'
+  else
+    log_trace job_succeeded info "$(trace_id)" success workspace_push_completed
+  fi
+}
+
+cmd_logs() {
+  local user="${1:-}"
+  require_user "$user"
+  remote "journalctl --user -u 'deepseek-harness-user@$user.service' -n 200 --no-pager; printf '\\n--- web log ---\\n'; tail -n 200 '$REMOTE_HOME/.local/state/deepseek-harness/instances/$user/web.log' 2>/dev/null || true"
+}
+
+main() {
+  local command="${1:-help}"
+  shift || true
+  case "$command" in
+    status) cmd_status ;;
+    sync)
+      case "${1:-}" in
+        source) cmd_sync_source ;;
+        pull) shift; cmd_sync_pull "$@" ;;
+        push) shift; cmd_sync_push "$@" ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    skills)
+      case "${1:-}" in
+        sync) cmd_skills_sync ;;
+        *) usage; exit 2 ;;
+      esac
+      ;;
+    logs) cmd_logs "${1:-}" ;;
+    ssh) exec ssh "${SSH_OPTS[@]}" "$SSH_TARGET" ;;
+    update) remote "$REMOTE_HOME/bin/deepseek-harness-update" ;;
+    open)
+      local sftp_url="sftp://$SERVER_USER@deepseek-ecs$REMOTE_REPO"
+      if [[ -d "/Applications/Cyberduck.app" ]]; then
+        open -a "/Applications/Cyberduck.app" "$sftp_url"
+      elif command -v cyberduck >/dev/null 2>&1; then
+        open "$sftp_url"
+      else
+        printf 'Cyberduck is not installed. Run: brew install --cask cyberduck\n' >&2
+        exit 1
+      fi
+      ;;
+    help|-h|--help) usage ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"

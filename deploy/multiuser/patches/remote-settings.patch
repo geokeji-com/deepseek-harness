@@ -1,0 +1,14 @@
+diff --git a/packages/client/ui-settings/src/client/index.ts b/packages/client/ui-settings/src/client/index.ts
+--- a/packages/client/ui-settings/src/client/index.ts
++++ b/packages/client/ui-settings/src/client/index.ts
+@@ -50,7 +50,9 @@ export function apply(ctx: Context): void {
+   const schema = new SettingsSchemaService(ctx)
+   // Resolved once here, where `remote` is declared in this plugin's own
+   // `inject`; the binder hands the same answer to every scope it binds.
+-  const persistence = ctx.remote.$host.isLoopback ? 'host' : 'memory'
++  // This deployment authenticates remote browser access before the app loads,
++  // so settings stay Host-backed instead of falling back to process-local memory.
++  const persistence = 'host'
+   const mirror = new SettingsDescribeMirror(ctx, persistence)
+   ctx.effect(() => {
+     const disposers = [

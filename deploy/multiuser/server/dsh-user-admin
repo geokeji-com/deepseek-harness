@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+export HOME="/home/dsh"
+export PATH="/home/dsh/.tools/pnpm/node_modules/.bin:/usr/bin:/bin"
+export USERS_FILE="/home/dsh/.config/deepseek-harness/multiuser/users.json"
+export PASSWORD_FILE="/home/dsh/.config/deepseek-harness/multiuser/new-user-passwords.txt"
+
+ROOT="/home/dsh"
+MULTI_ROOT="$ROOT/.config/deepseek-harness/multiuser"
+STATE_ROOT="$ROOT/.local/share/deepseek-harness/instances"
+SHARED_ROOT="$ROOT/.local/share/deepseek-harness/shared"
+SHARED_SKILLS_ROOT="$SHARED_ROOT/skills"
+WORKSPACE_ROOT="$ROOT/workspace"
+SHARED_PROJECTS="$ROOT/shared"
+ADMIN="$MULTI_ROOT/user-admin.mjs"
+export DSH_SHARED_ROOT="$SHARED_ROOT"
+export SHARED_PROJECTS_ROOT="$SHARED_PROJECTS/projects"
+export SHARED_SKILLS_ROOT
+export SHARED_PROFILES_ROOT="$SHARED_ROOT/profiles"
+export SHARED_PRESETS_ROOT="$SHARED_ROOT/agent-presets"
+
+usage() {
+  printf 'Usage: dsh-user-admin list|add <id> [port]|rotate <id>|enable <id>|disable <id>\n'
+}
+
+restart_manager() {
+  systemctl --user restart dsh-multiuser.service
+  for _ in {1..30}; do
+    if [[ "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3081/healthz || true)" == "200" ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  printf 'manager health check failed\n' >&2
+  return 1
+}
+
+user_port() {
+  node "$ADMIN" list | awk -v id="$1" '$1 == id { print $2; exit }'
+}
+
+ensure_layout() {
+  local id="$1" port="$2"
+  mkdir -p "$STATE_ROOT/$id/home" "$ROOT/.local/state/deepseek-harness/instances/$id" \
+    "$WORKSPACE_ROOT/$id" "$SHARED_PROJECTS/projects"
+  rm -rf "$STATE_ROOT/$id/home/profiles" "$STATE_ROOT/$id/home/skills" \
+    "$STATE_ROOT/$id/home/.agent-presets"
+  ln -s "$SHARED_ROOT/profiles" "$STATE_ROOT/$id/home/profiles"
+  ln -s "$SHARED_ROOT/skills" "$STATE_ROOT/$id/home/skills"
+  ln -s "$SHARED_ROOT/agent-presets" "$STATE_ROOT/$id/home/.agent-presets"
+  ln -sfn "$SHARED_PROJECTS/projects" "$WORKSPACE_ROOT/$id/shared"
+  printf 'DSH_HOME=%s\nDSH_PORT=%s\nDSH_USER_ID=%s\nDSH_WORKSPACE=%s\n' \
+    "$STATE_ROOT/$id/home" "$port" "$id" "$WORKSPACE_ROOT/$id" \
+    >"$MULTI_ROOT/instances/$id.env"
+  chmod 600 "$MULTI_ROOT/instances/$id.env"
+  node "$MULTI_ROOT/render-shared-agents.mjs" "$id" >/dev/null
+}
+
+rotate_cookie_secret() {
+  local temporary
+  temporary="$(mktemp)"
+  local secret
+  secret="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
+  sed "s/^AUTH_COOKIE_SECRET=.*/AUTH_COOKIE_SECRET=$secret/" \
+    "$MULTI_ROOT/multiuser.env" >"$temporary"
+  chmod 600 "$temporary"
+  mv "$temporary" "$MULTI_ROOT/multiuser.env"
+}
+
+command="${1:-}"
+case "$command" in
+  list)
+    node "$ADMIN" list | while IFS=$'\t' read -r id port state; do
+      printf '%s\t%s\t%s\t%s\n' "$id" "$port" "$state" \
+        "$(systemctl --user is-active "deepseek-harness-user@$id.service" 2>/dev/null || true)"
+    done
+    ;;
+  add)
+    id="${2:-}"
+    requested_port="${3:-}"
+    [[ -n "$id" ]] || { usage; exit 2; }
+    password="$(node "$ADMIN" add "$id" "$requested_port")"
+    port="$(user_port "$id")"
+    ensure_layout "$id" "$port"
+    restart_manager
+    printf 'user=%s port=%s password=%s\n' "$id" "$port" "$password"
+    ;;
+  rotate)
+    id="${2:-}"
+    [[ -n "$id" ]] || { usage; exit 2; }
+    password="$(node "$ADMIN" rotate "$id")"
+    rotate_cookie_secret
+    restart_manager
+    printf 'user=%s password=%s\n' "$id" "$password"
+    ;;
+  enable)
+    id="${2:-}"
+    [[ -n "$id" ]] || { usage; exit 2; }
+    node "$ADMIN" enable "$id"
+    port="$(user_port "$id")"
+    ensure_layout "$id" "$port"
+    restart_manager
+    printf 'user=%s enabled\n' "$id"
+    ;;
+  disable)
+    id="${2:-}"
+    [[ -n "$id" ]] || { usage; exit 2; }
+    node "$ADMIN" disable "$id"
+    systemctl --user stop "deepseek-harness-user@$id.service" >/dev/null 2>&1 || true
+    restart_manager
+    printf 'user=%s disabled\n' "$id"
+    ;;
+  *) usage; exit 2 ;;
+esac

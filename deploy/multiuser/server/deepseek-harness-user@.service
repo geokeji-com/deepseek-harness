@@ -1,0 +1,24 @@
+[Unit]
+Description=DeepSeek Harness Web (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/dsh/deepseek-harness
+Environment=HOME=/home/dsh
+Environment=PATH=/home/dsh/.tools/pnpm/node_modules/.bin:/usr/bin:/bin
+Environment=NODE_OPTIONS=--max-old-space-size=1536
+EnvironmentFile=-/home/dsh/.config/deepseek-harness/multiuser/shared.env
+EnvironmentFile=/home/dsh/.config/deepseek-harness/multiuser/instances/%i.env
+ExecStart=/usr/bin/node /home/dsh/.tools/pnpm/node_modules/pnpm/bin/pnpm.mjs dsh web --no-open --trusted-host 8.130.99.203 --port ${DSH_PORT}
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=20s
+UMask=0077
+StandardOutput=append:/home/dsh/.local/state/deepseek-harness/instances/%i/web.log
+StandardError=append:/home/dsh/.local/state/deepseek-harness/instances/%i/web.log
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

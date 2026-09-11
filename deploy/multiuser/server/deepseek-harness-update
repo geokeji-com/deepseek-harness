@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+REPO_DIR="/home/dsh/deepseek-harness"
+PATCH_FILE="/home/dsh/.local/share/deepseek-harness/patches/remote-settings.patch"
+export HOME="/home/dsh"
+export PATH="/home/dsh/.tools/pnpm/node_modules/.bin:/usr/bin:/bin"
+export npm_config_registry="https://registry.npmmirror.com"
+export NODE_OPTIONS="--max-old-space-size=2560"
+export UV_THREADPOOL_SIZE=2
+
+old_commit=""
+patch_applied=0
+instances_stopped=0
+trace_id="update-$(date -u +%Y%m%dT%H%M%SZ)"
+
+log_event() {
+  local event="$1" level="$2" status="$3" reason="$4"
+  printf '{"timestamp":"%s","event":"%s","level":"%s","trace_id":"%s","service":"dsh-update","env":"production","status":"%s","decision_reason":"%s"}\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$event" "$level" "$trace_id" "$status" "$reason"
+}
+
+restore_patch() {
+  if [[ "$patch_applied" -ne 1 ]]; then
+    return 0
+  fi
+  if git apply --reverse "$PATCH_FILE"; then
+    patch_applied=0
+    return 0
+  fi
+  log_event error_occurred error failed deployment_patch_reverse_failed
+  return 1
+}
+
+rollback() {
+  restore_patch || true
+  if [[ -n "$old_commit" && "$(git rev-parse HEAD)" != "$old_commit" ]]; then
+    git reset --hard "$old_commit" >/dev/null
+  fi
+  if [[ "$instances_stopped" -eq 1 ]]; then
+    systemctl --user restart dsh-multiuser.service >/dev/null 2>&1 || true
+  fi
+}
+
+on_error() {
+  local code="$1"
+  trap - ERR
+  log_event job_failed error failed update_failed_and_rolled_back
+  rollback
+  exit "$code"
+}
+trap 'on_error $?' ERR
+
+cd "$REPO_DIR"
+if [[ "$(git remote get-url origin)" != "https://github.com/deepseek-ai/deepseek-harness" \
+  && "$(git remote get-url origin)" != "https://github.com/deepseek-ai/deepseek-harness.git" ]]; then
+  log_event job_failed error failed origin_not_official_repository
+  exit 1
+fi
+if [[ -n "$(git status --porcelain)" ]]; then
+  log_event job_failed error failed repository_not_clean
+  exit 1
+fi
+if [[ ! -f "$PATCH_FILE" ]]; then
+  log_event job_failed error failed deployment_patch_missing
+  exit 1
+fi
+
+old_commit="$(git rev-parse HEAD)"
+log_event job_started info running update_started
+git fetch origin master --tags
+git pull --ff-only origin master
+git apply --check "$PATCH_FILE"
+git apply "$PATCH_FILE"
+patch_applied=1
+
+pnpm install --frozen-lockfile --store-dir "$HOME/.cache/pnpm/store" \
+  --fetch-timeout 120000 --fetch-retries 5
+pnpm run build
+restore_patch
+if [[ -n "$(git status --porcelain)" ]]; then
+  log_event job_failed error failed repository_dirty_after_build
+  exit 1
+fi
+
+new_commit="$(git rev-parse HEAD)"
+instances_stopped=1
+for user in owner member2 member3 member4; do
+  systemctl --user stop "deepseek-harness-user@$user.service" >/dev/null 2>&1 || true
+done
+systemctl --user restart dsh-multiuser.service
+
+healthy=0
+for _ in {1..60}; do
+  auth_code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3081/healthz || true)"
+  proxy_code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3080/ || true)"
+  if [[ "$auth_code" == "200" && "$proxy_code" == "401" ]]; then
+    healthy=1
+    break
+  fi
+  sleep 1
+done
+if [[ "$healthy" -ne 1 ]]; then
+  log_event job_failed error failed manager_healthcheck_failed
+  exit 1
+fi
+
+trap - ERR
+log_event job_succeeded info success update_completed
+printf 'Updated successfully: %s -> %s\n' "$old_commit" "$new_commit"

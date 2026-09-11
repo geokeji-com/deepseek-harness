@@ -1,0 +1,5 @@
+.backups/
+.secrets/
+config/server.env
+mirror/
+workspace/

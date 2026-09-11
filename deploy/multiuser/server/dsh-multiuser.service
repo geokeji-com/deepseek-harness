@@ -1,0 +1,22 @@
+[Unit]
+Description=DeepSeek Harness Multi-User Authentication and Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/dsh/.config/deepseek-harness/multiuser
+Environment=HOME=/home/dsh
+Environment=NODE_OPTIONS=--max-old-space-size=256
+EnvironmentFile=/home/dsh/.config/deepseek-harness/multiuser/multiuser.env
+ExecStart=/usr/bin/node /home/dsh/.config/deepseek-harness/multiuser/main.mjs
+Restart=always
+RestartSec=3s
+TimeoutStopSec=10s
+UMask=0077
+StandardOutput=append:/home/dsh/.local/state/deepseek-harness/multiuser.log
+StandardError=append:/home/dsh/.local/state/deepseek-harness/multiuser.log
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
