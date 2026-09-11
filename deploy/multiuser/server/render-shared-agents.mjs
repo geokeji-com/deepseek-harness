@@ -15,6 +15,8 @@ import { pathToFileURL } from 'node:url'
 
 const DEFAULT_INSTANCE_ROOT = '/home/dsh/.local/share/deepseek-harness/instances'
 const DEFAULT_WORKSPACE_ROOT = '/home/dsh/workspace'
+const DEFAULT_TEAM_WORKSPACE_ROOT = '/home/dsh/.local/share/deepseek-harness/shared/workspace'
+const DEFAULT_SHARED_HOME = '/home/dsh/.local/share/deepseek-harness/shared/home'
 const DEFAULT_SHARED_ROOT = '/home/dsh/.local/share/deepseek-harness/shared'
 const DEFAULT_SHARED_PROJECTS_ROOT = '/home/dsh/shared/projects'
 const DEFAULT_USERS = ['owner', 'member2', 'member3', 'member4']
@@ -22,6 +24,9 @@ const USER_ID = /^[a-z][a-z0-9-]{0,31}$/u
 
 export function renderSharedAgentsContent(options = {}) {
   const sharedRoot = resolve(options.sharedRoot ?? DEFAULT_SHARED_ROOT)
+  const teamWorkspaceRoot = resolve(
+    options.teamWorkspaceRoot ?? DEFAULT_TEAM_WORKSPACE_ROOT,
+  )
   const skillsRoot = resolve(options.skillsRoot ?? resolve(sharedRoot, 'skills'))
   const profilesRoot = resolve(options.profilesRoot ?? resolve(sharedRoot, 'profiles'))
   const presetsRoot = resolve(options.presetsRoot ?? resolve(sharedRoot, 'agent-presets'))
@@ -37,11 +42,14 @@ same file is symlinked into each member's DSH home and private workspace.
 
 - Read the current member ID from the \`DSH_USER_ID\` environment variable.
 - The only persistent writable root for agent-issued filesystem operations is
-  the directory in \`DSH_WORKSPACE\`.
-- The expected private root is \`/home/dsh/workspace/$DSH_USER_ID\`.
-- If \`DSH_USER_ID\` or \`DSH_WORKSPACE\` is missing, empty, or inconsistent with
-  that expected path, stop and refuse filesystem writes.
-- Never write outside \`DSH_WORKSPACE\`, including every path listed below.
+  \`${teamWorkspaceRoot}/$DSH_USER_ID\`.
+- The team workspace root is \`${teamWorkspaceRoot}\`. The shared Harness may
+  expose that root through \`DSH_WORKSPACE\`, but it does not make sibling
+  member directories writable.
+- If \`DSH_USER_ID\` or \`DSH_WORKSPACE\` is missing or empty, stop and refuse
+  filesystem writes.
+- Never write outside \`${teamWorkspaceRoot}/$DSH_USER_ID\`, including every
+  path listed below.
 
 ## Shared read-only resources
 
@@ -58,11 +66,12 @@ member sessions. A member session must treat every shared path as read-only.
 
 ## Mandatory filesystem rules
 
-1. Treat \`DSH_WORKSPACE\` as the default working directory and the only location
-   for persistent reads, writes, edits, deletes, moves, renames, permission
-   changes, generated files, and temporary files.
+1. Treat \`${teamWorkspaceRoot}/$DSH_USER_ID\` as the default working directory
+   and the only location for persistent reads, writes, edits, deletes, moves,
+   renames, permission changes, generated files, and temporary files.
 2. Before an operation, resolve the path canonically and verify that it remains
-   inside \`DSH_WORKSPACE\`. Reject the whole operation when it does not.
+   inside \`${teamWorkspaceRoot}/$DSH_USER_ID\`. Reject the whole operation when
+   it does not.
 3. Persistent writes into the shared state root, shared projects, another
    member's workspace, \`/home/dsh\`, the Harness source tree, settings,
    sessions, credentials, service files, databases, or logs are forbidden.
@@ -72,9 +81,10 @@ member sessions. A member session must treat every shared path as read-only.
 5. Read-only shared resources may be opened or executed, but never modified,
    deleted, renamed, chmodded, packaged, patched, updated in place, or used as
    a destination for generated output.
-6. Keep temporary files under \`DSH_WORKSPACE\`. If the operating system requires
-   another temporary directory, use a uniquely named ephemeral path, store no
-   persistent data there, and clean it up before finishing.
+6. Keep temporary files under \`${teamWorkspaceRoot}/$DSH_USER_ID\`. If the
+   operating system requires another temporary directory, use a uniquely named
+   ephemeral path, store no persistent data there, and clean it up before
+   finishing.
 7. Do not run package managers, build tools, tests, or scripts with options that
    modify global system state, home-directory dotfiles, shared resources, or
    another member's files.
@@ -111,6 +121,7 @@ async function replaceWithSymlink(linkPath, targetPath) {
 export async function renderSharedAgents(options = {}) {
   const instanceRoot = resolve(options.instanceRoot ?? DEFAULT_INSTANCE_ROOT)
   const workspaceRoot = resolve(options.workspaceRoot ?? DEFAULT_WORKSPACE_ROOT)
+  const sharedHome = resolve(options.sharedHome ?? DEFAULT_SHARED_HOME)
   const sharedRoot = resolve(options.sharedRoot ?? DEFAULT_SHARED_ROOT)
   const target = resolve(sharedRoot, 'AGENTS.md')
   const users = [...new Set(options.users ?? DEFAULT_USERS)]
@@ -120,6 +131,7 @@ export async function renderSharedAgents(options = {}) {
 
   const content = renderSharedAgentsContent({
     sharedRoot,
+    teamWorkspaceRoot: options.teamWorkspaceRoot,
     skillsRoot: options.skillsRoot,
     profilesRoot: options.profilesRoot,
     presetsRoot: options.presetsRoot,
@@ -134,6 +146,11 @@ export async function renderSharedAgents(options = {}) {
   await rename(temporary, target)
 
   const links = []
+  for (const link of [resolve(sharedHome, 'AGENTS.md')]) {
+    await mkdir(dirname(link), { recursive: true, mode: 0o700 })
+    await replaceWithSymlink(link, target)
+    links.push(link)
+  }
   for (const userId of users) {
     const home = resolve(instanceRoot, userId, 'home')
     const workspace = resolve(workspaceRoot, userId)
@@ -152,6 +169,8 @@ async function main() {
     users: users.length === 0 ? DEFAULT_USERS : users,
     instanceRoot: process.env.INSTANCE_ROOT,
     workspaceRoot: process.env.WORKSPACE_ROOT,
+    teamWorkspaceRoot: process.env.TEAM_WORKSPACE_ROOT,
+    sharedHome: process.env.SHARED_HOME,
     sharedRoot: process.env.DSH_SHARED_ROOT,
     skillsRoot: process.env.SHARED_SKILLS_ROOT,
     profilesRoot: process.env.SHARED_PROFILES_ROOT,

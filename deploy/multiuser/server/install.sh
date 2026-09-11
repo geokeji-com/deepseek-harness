@@ -39,6 +39,22 @@ log() {
 
 run_install() {
   log job_started running migrate_current_state
+  systemctl --user stop \
+    'deepseek-harness-user@*.service' \
+    dsh-multiuser.service \
+    deepseek-harness.service \
+    deepseek-harness-auth.service >/dev/null 2>&1 || true
+  for _ in {1..30}; do
+    if ! systemctl --user is-active --quiet \
+      'deepseek-harness-user@*.service' \
+      dsh-multiuser.service \
+      deepseek-harness.service \
+      deepseek-harness-auth.service >/dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+
   mkdir -p "$MULTI_ROOT" "$MULTI_ROOT/instances" "$INSTANCE_ROOT" \
     "$SHARED_ROOT" "$PATCH_ROOT" "$SKILLS_ROOT" "$WORKSPACE_ROOT" "$PROJECT_SHARED_ROOT" \
     "$LOG_ROOT/instances" "$SHARED_LOG_ROOT" "$SHARED_HOME" "$TEAM_WORKSPACE_ROOT" \
@@ -55,8 +71,6 @@ run_install() {
   cp -a "$INSTANCE_ROOT/owner/home/settings.yaml" "$BACKUP_ROOT/config/" 2>/dev/null || true
   cp -a "$INSTANCE_ROOT/owner/home/.credentials.yaml" "$BACKUP_ROOT/config/" 2>/dev/null || true
   cp -a "$INSTANCE_ROOT/owner/home/storages/workspace.json" "$BACKUP_ROOT/config/" 2>/dev/null || true
-
-  systemctl --user stop deepseek-harness.service deepseek-harness-auth.service 2>/dev/null || true
 
   if [[ ! -d "$INSTANCE_ROOT/owner/home" ]]; then
     mkdir -p "$INSTANCE_ROOT/owner/home"
@@ -201,7 +215,12 @@ install_multiuser() {
     chmod 600 "$env_file"
   done
 
-  INSTANCE_ROOT="$INSTANCE_ROOT" WORKSPACE_ROOT="$WORKSPACE_ROOT" \
+  local agents_workspace_root="$WORKSPACE_ROOT"
+  if [[ "$BACKEND_MODE" == "shared" ]]; then
+    agents_workspace_root="$TEAM_WORKSPACE_ROOT"
+  fi
+  INSTANCE_ROOT="$INSTANCE_ROOT" WORKSPACE_ROOT="$agents_workspace_root" \
+    TEAM_WORKSPACE_ROOT="$TEAM_WORKSPACE_ROOT" SHARED_HOME="$SHARED_HOME" \
     DSH_SHARED_ROOT="$SHARED_ROOT" SHARED_PROJECTS_ROOT="$PROJECT_SHARED_ROOT/projects" \
     SHARED_SKILLS_ROOT="$SKILLS_ROOT" SHARED_PROFILES_ROOT="$SHARED_ROOT/profiles" \
     SHARED_PRESETS_ROOT="$SHARED_ROOT/agent-presets" \
