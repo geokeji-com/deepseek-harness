@@ -159,6 +159,48 @@ test('is idempotent when the member registries and shared output already agree',
   }
 })
 
+test('moves an explicitly configured legacy path into the owner root', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-shared-workspaces-alias-'))
+  const legacyRoot = join(root, 'legacy')
+  const teamRoot = join(root, 'team')
+  const source = join(root, 'homes/owner/storages/workspace.json')
+  const output = join(root, 'shared/storages/workspace.json')
+  const oldPath = join(legacyRoot, '001')
+  const newPath = join(teamRoot, 'owner/001')
+
+  try {
+    await mkdir(oldPath, { recursive: true })
+    await writeFile(join(oldPath, 'legacy.txt'), 'legacy\n')
+    await writeRegistry(source, registry({
+      legacyWorkspace: {
+        path: oldPath,
+        title: '001',
+        sessionIds: ['legacy-session'],
+        createdAt: '2026-01-01T00:00:00.000Z',
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      },
+    }))
+
+    const summary = await migrateSharedWorkspaces(
+      [{ owner: 'owner', path: source }],
+      output,
+      {
+        legacyRoot,
+        teamRoot,
+        legacyMoves: [{ owner: 'owner', from: oldPath, to: newPath }],
+      },
+    )
+
+    assert.equal(summary.movedRoots, 1)
+    assert.equal(await exists(oldPath), false)
+    assert.equal(await exists(join(newPath, 'legacy.txt')), true)
+    const merged = JSON.parse(await readFile(output, 'utf8'))
+    assert.equal(merged.tables.workspaces.legacyWorkspace.path, newPath)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('rejects a workspace id collision before moving member roots', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-shared-workspaces-conflict-'))
   const legacyRoot = join(root, 'legacy')

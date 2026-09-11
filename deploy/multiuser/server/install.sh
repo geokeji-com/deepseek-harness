@@ -88,9 +88,6 @@ run_install() {
   install -m 0644 "$SOURCE_DIR/../patches/remote-settings.patch" \
     "$PATCH_ROOT/remote-settings.patch"
 
-  if [[ -d "$WORKSPACE_ROOT/001" && ! -e "$WORKSPACE_ROOT/owner" ]]; then
-    cp -a "$WORKSPACE_ROOT/001" "$WORKSPACE_ROOT/owner"
-  fi
   mkdir -p "$WORKSPACE_ROOT/owner" "$WORKSPACE_ROOT/member2" \
     "$WORKSPACE_ROOT/member3" "$WORKSPACE_ROOT/member4" "$PROJECT_SHARED_ROOT/projects"
   chmod 700 "$WORKSPACE_ROOT" "$WORKSPACE_ROOT/owner" "$WORKSPACE_ROOT/member2" \
@@ -168,15 +165,22 @@ install_multiuser() {
   fi
 
   local workspace_migration_sources=()
+  local workspace_migration_moves=()
   for user in owner member2 member3 member4; do
     local registry="$INSTANCE_ROOT/$user/home/storages/workspace.json"
     if [[ -f "$registry" ]]; then
       workspace_migration_sources+=(--source "$user=$registry")
     fi
   done
+  if [[ -e "$WORKSPACE_ROOT/001" || -e "$TEAM_WORKSPACE_ROOT/owner/001" ]]; then
+    workspace_migration_moves+=(
+      --legacy-move "owner=$WORKSPACE_ROOT/001=$TEAM_WORKSPACE_ROOT/owner/001"
+    )
+  fi
   if ((${#workspace_migration_sources[@]} > 0)); then
     node "$SOURCE_DIR/../tools/migrate-shared-workspaces.mjs" \
       "${workspace_migration_sources[@]}" \
+      "${workspace_migration_moves[@]}" \
       --legacy-root "$WORKSPACE_ROOT" \
       --team-root "$TEAM_WORKSPACE_ROOT" \
       --output "$SHARED_HOME/storages/workspace.json"
@@ -193,6 +197,11 @@ install_multiuser() {
       )
     fi
   done
+  if [[ -e "$WORKSPACE_ROOT/001" || -e "$TEAM_WORKSPACE_ROOT/owner/001" ]]; then
+    migration_cwd_prefixes+=(
+      --cwd-prefix "$WORKSPACE_ROOT/001=$TEAM_WORKSPACE_ROOT/owner/001"
+    )
+  fi
   if ((${#migration_sources[@]} > 0)); then
     node "$SOURCE_DIR/../tools/migrate-sessions-v4.mjs" \
       "${migration_sources[@]}" \

@@ -36,6 +36,7 @@ export async function migrateSharedWorkspaces(sources, output, options) {
   const legacyRoot = resolve(requiredPath(options.legacyRoot, '--legacy-root'))
   const teamRoot = resolve(requiredPath(options.teamRoot, '--team-root'))
   const outputPath = resolve(requiredPath(output, 'shared workspace output'))
+  const legacyMoves = validateLegacyMoves(options.legacyMoves ?? [])
   const owners = new Set()
   const migrations = []
 
@@ -50,38 +51,50 @@ export async function migrateSharedWorkspaces(sources, output, options) {
     const registry = validateRegistry(await readJson(source.path), source.path)
     const oldUserRoot = join(legacyRoot, source.owner)
     const newUserRoot = join(teamRoot, source.owner)
-    const oldExists = await pathExists(oldUserRoot)
-    const newExists = await pathExists(newUserRoot)
-    if (oldExists && newExists) {
-      throw new WorkspaceMigrationError(
-        `both legacy and shared workspace roots exist for ${source.owner}: ${oldUserRoot}, ${newUserRoot}`,
-      )
+    const moves = [
+      { from: oldUserRoot, to: newUserRoot },
+      ...legacyMoves
+        .filter(move => move.owner === source.owner)
+        .map(({ from, to }) => ({ from, to })),
+    ].toSorted((left, right) => left.to.split('/').length - right.to.split('/').length)
+    for (const move of moves) {
+      const oldExists = await pathExists(move.from)
+      const newExists = await pathExists(move.to)
+      if (oldExists && newExists) {
+        throw new WorkspaceMigrationError(
+          `both legacy and shared workspace paths exist for ${source.owner}: ${move.from}, ${move.to}`,
+        )
+      }
+      move.oldExists = oldExists
+      move.newExists = newExists
     }
-    migrations.push({ owner: source.owner, registry, oldUserRoot, newUserRoot, oldExists, newExists })
+    migrations.push({ owner: source.owner, registry, moves })
   }
 
   const target = await collectTarget(outputPath)
   for (const migration of migrations) {
-    mergeRegistry(target, migration, legacyRoot, teamRoot)
+    mergeRegistry(target, migration)
   }
 
   const moved = []
   try {
     for (const migration of migrations) {
-      if (!migration.oldExists) continue
-      await mkdir(dirname(migration.newUserRoot), { recursive: true })
-      await rename(migration.oldUserRoot, migration.newUserRoot)
-      moved.push(migration)
-      options.afterMove?.(migration.owner)
+      for (const move of migration.moves) {
+        if (!move.oldExists) continue
+        await mkdir(dirname(move.to), { recursive: true })
+        await rename(move.from, move.to)
+        moved.push({ ...move, owner: migration.owner })
+        options.afterMove?.(migration.owner)
+      }
     }
 
     await publishRegistry(outputPath, target)
   } catch (error) {
     const rollbackErrors = []
-    for (const migration of moved.reverse()) {
-      if (await pathExists(migration.newUserRoot) && !await pathExists(migration.oldUserRoot)) {
+    for (const move of moved.reverse()) {
+      if (await pathExists(move.to) && !await pathExists(move.from)) {
         try {
-          await rename(migration.newUserRoot, migration.oldUserRoot)
+          await rename(move.to, move.from)
         } catch (rollbackError) {
           rollbackErrors.push(rollbackError)
         }
@@ -114,10 +127,8 @@ async function collectTarget(outputPath) {
   return validateRegistry(await readJson(outputPath), outputPath, 'existing shared ')
 }
 
-function mergeRegistry(target, migration, legacyRoot, teamRoot) {
+function mergeRegistry(target, migration) {
   const { registry, owner } = migration
-  const oldUserRoot = join(legacyRoot, owner)
-  const newUserRoot = join(teamRoot, owner)
   const sourceState = registry.global
   const sourceWorkspaces = registry.tables.workspaces
   const workspaceIds = Array.isArray(sourceState?.workspaceIds)
@@ -149,7 +160,7 @@ function mergeRegistry(target, migration, legacyRoot, teamRoot) {
     if (typeof record.path !== 'string') {
       throw new WorkspaceMigrationError(`workspace path is invalid ${workspaceId}/${owner}`)
     }
-    const path = rewriteManagedPath(record.path, oldUserRoot, newUserRoot, owner)
+    const path = rewriteManagedPath(record.path, migration.moves, owner)
     const existing = target.tables.workspaces[workspaceId]
     if (existing === undefined) {
       const pathOwner = targetPaths.get(path)
@@ -168,8 +179,8 @@ function mergeRegistry(target, migration, legacyRoot, teamRoot) {
       }
       targetPaths.set(path, workspaceId)
     } else {
-      const existingIsSourcePath = existing.path === oldUserRoot
-        || existing.path.startsWith(`${oldUserRoot}/`)
+      const existingIsSourcePath = migration.moves.some(move =>
+        existing.path === move.from || existing.path.startsWith(`${move.from}/`))
       if (existing.path !== path && !existingIsSourcePath) {
         throw new WorkspaceMigrationError(
           `workspace id collision for ${workspaceId}: existing ${existing.path}, incoming ${path}`,
@@ -295,15 +306,41 @@ function validateRegistry(value, path, label = '') {
   }
 }
 
-function rewriteManagedPath(path, oldUserRoot, newUserRoot, owner) {
+function rewriteManagedPath(path, moves, owner) {
   const absolute = resolve(path)
-  if (absolute === oldUserRoot || absolute.startsWith(`${oldUserRoot}/`)) {
-    return `${newUserRoot}${absolute.slice(oldUserRoot.length)}`
+  for (const move of moves) {
+    if (absolute === move.from || absolute.startsWith(`${move.from}/`)) {
+      return `${move.to}${absolute.slice(move.from.length)}`
+    }
   }
-  if (absolute === newUserRoot || absolute.startsWith(`${newUserRoot}/`)) return absolute
+  for (const move of moves) {
+    if (absolute === move.to || absolute.startsWith(`${move.to}/`)) return absolute
+  }
   throw new WorkspaceMigrationError(
-    `workspace path for ${owner} is outside ${oldUserRoot} and ${newUserRoot}: ${path}`,
+    `workspace path for ${owner} is outside the configured source and target roots: ${path}`,
   )
+}
+
+function validateLegacyMoves(moves) {
+  if (!Array.isArray(moves)) throw new WorkspaceMigrationError('legacy moves must be an array')
+  const seen = new Set()
+  return moves.map((move) => {
+    if (move === null || typeof move !== 'object' || Array.isArray(move)) {
+      throw new WorkspaceMigrationError('legacy move must be an object')
+    }
+    if (!USER_ID.test(move.owner)) {
+      throw new WorkspaceMigrationError(`invalid legacy move owner: ${JSON.stringify(move.owner)}`)
+    }
+    const from = resolve(requiredPath(move.from, 'legacy move source'))
+    const to = resolve(requiredPath(move.to, 'legacy move target'))
+    const key = `${move.owner}\0${from}\0${to}`
+    if (seen.has(key)) throw new WorkspaceMigrationError(`duplicate legacy move: ${key}`)
+    seen.add(key)
+    if (from === to || to.startsWith(`${from}/`)) {
+      throw new WorkspaceMigrationError(`legacy move target is inside its source: ${from} -> ${to}`)
+    }
+    return { owner: move.owner, from, to }
+  })
 }
 
 async function publishRegistry(outputPath, value) {
@@ -361,6 +398,7 @@ function parseArguments(argv) {
   let output
   let legacyRoot
   let teamRoot
+  const legacyMoves = []
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]
     if (arg === '--source') {
@@ -376,11 +414,24 @@ function parseArguments(argv) {
       legacyRoot = argv[++index]
     } else if (arg === '--team-root') {
       teamRoot = argv[++index]
+    } else if (arg === '--legacy-move') {
+      const value = argv[++index]
+      const first = value?.indexOf('=')
+      const last = value?.lastIndexOf('=')
+      if (first === undefined || first < 1 || last === undefined || last <= first
+        || last === value.length - 1) {
+        throw new WorkspaceMigrationError('--legacy-move must be owner=from=to')
+      }
+      legacyMoves.push({
+        owner: value.slice(0, first),
+        from: value.slice(first + 1, last),
+        to: value.slice(last + 1),
+      })
     } else {
       throw new WorkspaceMigrationError(`unknown argument: ${arg}`)
     }
   }
-  return { sources, output, legacyRoot, teamRoot }
+  return { sources, output, legacyRoot, teamRoot, legacyMoves }
 }
 
 async function main() {
@@ -388,6 +439,7 @@ async function main() {
   const summary = await migrateSharedWorkspaces(options.sources, options.output, {
     legacyRoot: options.legacyRoot,
     teamRoot: options.teamRoot,
+    legacyMoves: options.legacyMoves,
   })
   process.stdout.write(`${JSON.stringify(summary)}\n`)
 }
