@@ -14,6 +14,7 @@ import { readFileSync } from 'node:fs'
 import { basename, dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { constants, zstdCompressSync, zstdDecompressSync } from 'node:zlib'
+import { sessionDirectory } from './session-paths.mjs'
 
 const USER_ID = /^[a-z][a-z0-9-]{0,31}$/u
 const GENERATION = /^session(?:\.v([1-9][0-9]*))?\.jsonl(?:\.zstd)?$/u
@@ -143,10 +144,15 @@ export async function migrateSessionsV4(sources, output, options = {}) {
         skipped += 1
         continue
       }
-      const sourceRelative = relative(entry.sourceRoot, entry.sourceFile)
-      const target = join(staging, dirname(sourceRelative), 'session.v4.jsonl')
+      const targetCwd = entry.cwd === undefined
+        ? undefined
+        : rewriteCwd(entry.cwd, cwdPrefixes)
+      const target = join(
+        sessionDirectory(staging, targetCwd, entry.id),
+        'session.v4.jsonl',
+      )
       await mkdir(dirname(target), { recursive: true })
-      await writeV4Generation(entry.sourceFile, `${target}.zstd`, entry.owner, cwdPrefixes)
+      await writeV4Generation(entry.sourceFile, `${target}.zstd`, entry.owner, targetCwd)
       options.afterPrepare?.(entry)
       published += 1
     }
@@ -222,6 +228,7 @@ async function inspectSource(file, sourceRoot, owner) {
   return {
     id: header.id,
     owner,
+    cwd: header.cwd,
     parentSession: header.parentSession,
     relative: relative(sourceRoot, file),
   }
@@ -252,7 +259,7 @@ async function collectExistingTargets(outputRoot) {
   return targets
 }
 
-async function writeV4Generation(source, target, owner, cwdPrefixes) {
+async function writeV4Generation(source, target, owner, targetCwd) {
   const sourceText = await readGenerationText(source)
   const sourceLines = sourceText.split('\n')
   if (sourceLines.at(-1) === '') sourceLines.pop()
@@ -288,9 +295,9 @@ async function writeV4Generation(source, target, owner, cwdPrefixes) {
     ...sourceHeader,
     version: 4,
     ownerUserId: owner,
-    ...(sourceHeader.cwd === undefined
+    ...(targetCwd === undefined
       ? {}
-      : { cwd: rewriteCwd(sourceHeader.cwd, cwdPrefixes) }),
+      : { cwd: targetCwd }),
   }
   const rows = [
     releasedV4SessionFormatCodec.encodeHeader(targetHeader, inheritedEventCount),

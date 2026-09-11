@@ -9,6 +9,7 @@ import {
   migrateSessionsV4,
   SessionMigrationError,
 } from './migrate-sessions-v4.mjs'
+import { encodeSegment, projectKey } from './session-paths.mjs'
 
 const ZSTD_MAGIC = 0xFD2FB528
 const ZSTD_OPTIONS = { params: { [constants.ZSTD_c_checksumFlag]: 1 } }
@@ -104,7 +105,12 @@ test('migrates a plain V3 generation to zstd V4 and rewrites cwd', async () => {
       skipped: 0,
       output,
     })
-    const target = join(output, relative, 'session.v4.jsonl.zstd')
+    const target = join(
+      output,
+      projectKey(newCwd),
+      encodeSegment('session-plain'),
+      'session.v4.jsonl.zstd',
+    )
     assert.equal(await exists(target), true)
     assert.equal(await exists(join(output, relative, 'session.v4.jsonl')), false)
     assert.deepEqual(await readV4Header(target), {
@@ -124,10 +130,12 @@ test('reads zstd V3, inherits parents, skips existing V4, and preserves old gene
   const source = join(root, 'owner/sessions')
   const output = join(root, 'shared/sessions')
   const cwd = join(root, 'legacy/owner/project')
-  const parentRelative = '--legacy-owner-project--/parent'
-  const childRelative = '--legacy-owner-project--/child'
-  await writeZstdSession(source, parentRelative, header('parent', cwd))
-  await writeZstdSession(source, childRelative, header('child', cwd, {
+  const sourceParentRelative = '--legacy-owner-project--/parent'
+  const sourceChildRelative = '--legacy-owner-project--/child'
+  const targetParentRelative = join(projectKey(cwd), encodeSegment('parent'))
+  const targetChildRelative = join(projectKey(cwd), encodeSegment('child'))
+  await writeZstdSession(source, sourceParentRelative, header('parent', cwd))
+  await writeZstdSession(source, sourceChildRelative, header('child', cwd, {
     parentSession: 'parent',
   }))
 
@@ -136,15 +144,19 @@ test('reads zstd V3, inherits parents, skips existing V4, and preserves old gene
     assert.equal(first.published, 2)
     assert.equal(first.skipped, 0)
 
-    const oldGeneration = join(output, parentRelative, 'session.v2.jsonl')
+    const oldGeneration = join(output, targetParentRelative, 'session.v2.jsonl')
     await writeFile(oldGeneration, 'preserved\n')
     const second = await migrateSessionsV4([{ owner: 'owner', path: source }], output)
 
     assert.equal(second.published, 0)
     assert.equal(second.skipped, 2)
     assert.equal(await exists(oldGeneration), true)
-    assert.equal(await exists(join(output, `${parentRelative}.backup`)), false)
-    const childHeader = await readV4Header(join(output, childRelative, 'session.v4.jsonl.zstd'))
+    assert.equal(await exists(join(output, `${targetParentRelative}.backup`)), false)
+    const childHeader = await readV4Header(join(
+      output,
+      targetChildRelative,
+      'session.v4.jsonl.zstd',
+    ))
     assert.equal(childHeader.ownerUserId, 'owner')
     assert.equal(childHeader.parentSession, 'parent')
   } finally {
