@@ -11,6 +11,14 @@ function positiveInt(value, name) {
   return parsed
 }
 
+function positiveInteger(value, name) {
+  const parsed = Number(value)
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new Error(`${name} must be a positive integer`)
+  }
+  return parsed
+}
+
 export function loadConfig() {
   const usersPath = process.env.USERS_FILE
     ?? '/home/dsh/.config/deepseek-harness/multiuser/users.json'
@@ -38,10 +46,13 @@ export function loadConfig() {
     proxyPort: positiveInt(process.env.MANAGER_PROXY_PORT ?? '3080', 'MANAGER_PROXY_PORT'),
     authPort: positiveInt(process.env.AUTH_PORT ?? '3081', 'AUTH_PORT'),
     publicHost: process.env.PUBLIC_HOST ?? '8.130.99.203',
-    cookieDays: Number(process.env.COOKIE_DAYS ?? '30'),
+    cookieDays: positiveInteger(process.env.COOKIE_DAYS ?? '30', 'COOKIE_DAYS'),
     cookieSecret: process.env.AUTH_COOKIE_SECRET ?? '',
-    idleMs: Number(process.env.IDLE_MINUTES ?? '120') * 60 * 1000,
-    startTimeoutMs: Number(process.env.START_TIMEOUT_SECONDS ?? '45') * 1000,
+    idleMs: positiveInteger(process.env.IDLE_MINUTES ?? '120', 'IDLE_MINUTES') * 60 * 1000,
+    startTimeoutMs: positiveInteger(
+      process.env.START_TIMEOUT_SECONDS ?? '45',
+      'START_TIMEOUT_SECONDS',
+    ) * 1000,
     pathPolicy: {
       workspaceRoot: process.env.WORKSPACE_ROOT
         ?? '/home/dsh/workspace',

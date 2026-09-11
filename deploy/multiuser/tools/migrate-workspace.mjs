@@ -254,6 +254,13 @@ async function main() {
     if (targetDirectory !== currentDirectory && await exists(targetDirectory)) {
       throw new Error(`target session directory already exists: ${targetDirectory}`)
     }
+    const cachePath = join(cacheRoot, `${sessionId}.json`)
+    let cache
+    try {
+      cache = await readJson(cachePath)
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error
+    }
     sessions.push({
       sessionId,
       currentDirectory,
@@ -262,6 +269,8 @@ async function main() {
       bytes,
       firstFrameEnd,
       header,
+      cachePath,
+      cache,
     })
   }
 
@@ -280,19 +289,16 @@ async function main() {
       recursive: true,
       preserveTimestamps: true,
     })
-    try {
-      await cp(
-        join(cacheRoot, `${session.sessionId}.json`),
-        join(backup, `cache-${index}.json`),
-        { preserveTimestamps: true },
-      )
-    } catch (error) {
-      if (error?.code !== 'ENOENT') throw error
+    if (session.cache !== undefined) {
+      await cp(session.cachePath, join(backup, `cache-${index}.json`), {
+        preserveTimestamps: true,
+      })
     }
   }
 
   const movedSessions = []
   let movedWorkspace = false
+  const cacheWrites = new Map()
   try {
     if (oldDirectoryExists) {
       await mkdir(dirname(options.newPath), { recursive: true })
@@ -314,12 +320,12 @@ async function main() {
         await rename(session.currentDirectory, session.targetDirectory)
         movedSessions.push(session)
       }
-      const cachePath = join(cacheRoot, `${session.sessionId}.json`)
-      if (await exists(cachePath)) {
-        const cache = await readJson(cachePath)
+      if (session.cache !== undefined) {
+        const cache = structuredClone(session.cache)
         if (cache?.record?.identity !== undefined) {
           cache.record.identity.cwd = options.newPath
-          await writeJsonAtomic(cachePath, cache)
+          cacheWrites.set(session.sessionId, true)
+          await writeJsonAtomic(session.cachePath, cache)
         }
       }
     }
@@ -327,18 +333,44 @@ async function main() {
     workspace.path = options.newPath
     await writeJsonAtomic(workspaceRegistryPath, registry)
   } catch (error) {
+    const rollbackErrors = []
     for (const session of movedSessions.reverse()) {
       if (await exists(session.targetDirectory) && !await exists(session.currentDirectory)) {
         await mkdir(dirname(session.currentDirectory), { recursive: true })
-        await rename(session.targetDirectory, session.currentDirectory)
+        try {
+          await rename(session.targetDirectory, session.currentDirectory)
+        } catch (rollbackError) {
+          rollbackErrors.push(rollbackError)
+        }
       }
     }
     if (movedWorkspace && await exists(options.newPath) && !await exists(options.oldPath)) {
-      await rename(options.newPath, options.oldPath)
+      try {
+        await rename(options.newPath, options.oldPath)
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError)
+      }
     }
+    for (const session of sessions) {
+      try {
+        if (await exists(session.currentDirectory)) {
+          await writeBufferAtomic(session.logPath, session.bytes)
+          if (session.cache !== undefined) {
+            await writeJsonAtomic(session.cachePath, session.cache)
+          } else if (cacheWrites.has(session.sessionId)) {
+            await rm(session.cachePath, { force: true })
+          }
+        }
+      } catch (rollbackError) {
+        rollbackErrors.push(rollbackError)
+      }
+    }
+    const rollbackNote = rollbackErrors.length === 0
+      ? 'rollback completed'
+      : `rollback encountered ${rollbackErrors.length} additional error(s)`
     throw new Error(
-      `migration failed and rollback was attempted; backup retained at ${backup}: ${error.message}`,
-      { cause: error },
+      `migration failed; ${rollbackNote}; backup retained at ${backup}: ${error.message}`,
+      { cause: rollbackErrors[0] ?? error },
     )
   }
 

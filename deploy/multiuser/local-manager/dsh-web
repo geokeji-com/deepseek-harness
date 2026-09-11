@@ -14,7 +14,7 @@ trace_id() {
 }
 
 cmd_status() {
-  remote 'systemctl --user --no-pager --full status dsh-multiuser.service deepseek-harness-user@owner.service deepseek-harness-user@member2.service deepseek-harness-user@member3.service deepseek-harness-user@member4.service 2>&1 | sed -n "1,220p"; printf "\n--- listeners ---\n"; ss -ltnp | grep -E ":(3080|3081|3090|3091|3092|3093)[[:space:]]" || true; printf "\n--- memory ---\n"; free -h'
+  remote 'printf "%s\n" "--- manager ---"; systemctl --user --no-pager --full status dsh-multiuser.service 2>&1 || true; printf "\n--- user instances ---\n"; systemctl --user --no-pager --full list-units --all "deepseek-harness-user@*.service" 2>&1 || true; printf "\n--- listeners ---\n"; ss -ltnp | grep -E "node|dsh" || true; printf "\n--- memory ---\n"; free -h'
 }
 
 cmd_sync_source() {
@@ -56,7 +56,7 @@ cmd_skills_sync() {
     -e "ssh ${SSH_OPTS[*]}" \
     "$local_path/" "$SSH_TARGET:$remote_path/"
   remote "'$REMOTE_HOME/bin/dsh-skills-sync' --source '$remote_path'"
-  remote "export XDG_RUNTIME_DIR=/run/user/1000; export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus; for user in owner member2 member3 member4; do systemctl --user try-restart \"deepseek-harness-user@\$user.service\"; done"
+  remote "export XDG_RUNTIME_DIR=/run/user/1000; export DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus; systemctl --user list-units --type=service --all 'deepseek-harness-user@*.service' --no-legend | awk '{print \$1}' | while read -r unit; do systemctl --user try-restart \"\$unit\"; done"
   log_trace job_succeeded info "$(trace_id)" success shared_skills_synced
 }
 
@@ -106,7 +106,7 @@ cmd_sync_push() {
 
 cmd_logs() {
   local user="${1:-}"
-  require_user "$user"
+  require_instance_user "$user"
   remote "journalctl --user -u 'deepseek-harness-user@$user.service' -n 200 --no-pager; printf '\\n--- web log ---\\n'; tail -n 200 '$REMOTE_HOME/.local/state/deepseek-harness/instances/$user/web.log' 2>/dev/null || true"
 }
 

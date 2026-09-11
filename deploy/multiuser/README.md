@@ -88,7 +88,9 @@ dsh-user-admin enable analyst
 ```
 
 Adding or enabling a user writes a new password only to the command output.
-The server stores the scrypt hash in `users.json`.
+The server stores the scrypt hash in `users.json`. Rotating one user's password
+invalidates only that user's existing browser cookies; other users remain
+signed in.
 
 The source checkout remains on the official repository and is updated with:
 
@@ -97,7 +99,9 @@ deepseek-harness-update
 ```
 
 The update script refuses a dirty checkout, applies the remote-settings patch
-only for the build, and does not restart the service after a failed build.
+only for the build, and does not restart the service after a failed build. A
+failed update restores the previous revision and rebuilds its dependencies and
+artifacts before exiting.
 
 ## Local manager
 

@@ -57,17 +57,6 @@ ensure_layout() {
   node "$MULTI_ROOT/render-shared-agents.mjs" "$id" >/dev/null
 }
 
-rotate_cookie_secret() {
-  local temporary
-  temporary="$(mktemp)"
-  local secret
-  secret="$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '=')"
-  sed "s/^AUTH_COOKIE_SECRET=.*/AUTH_COOKIE_SECRET=$secret/" \
-    "$MULTI_ROOT/multiuser.env" >"$temporary"
-  chmod 600 "$temporary"
-  mv "$temporary" "$MULTI_ROOT/multiuser.env"
-}
-
 command="${1:-}"
 case "$command" in
   list)
@@ -90,7 +79,6 @@ case "$command" in
     id="${2:-}"
     [[ -n "$id" ]] || { usage; exit 2; }
     password="$(node "$ADMIN" rotate "$id")"
-    rotate_cookie_secret
     restart_manager
     printf 'user=%s password=%s\n' "$id" "$password"
     ;;

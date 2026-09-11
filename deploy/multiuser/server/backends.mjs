@@ -25,8 +25,8 @@ function portOpen(port) {
   })
 }
 
-function launchToken(userId) {
-  const path = `${LOG_ROOT}/${userId}/web.log`
+function launchToken(userId, logRoot = LOG_ROOT) {
+  const path = `${logRoot}/${userId}/web.log`
   if (!existsSync(path)) return undefined
   const stats = statSync(path)
   const length = Math.min(stats.size, 131072)
@@ -63,8 +63,8 @@ function establishedPorts() {
   return ports
 }
 
-async function bootstrapCookie(port, publicHost, userId) {
-  const token = launchToken(userId)
+async function bootstrapCookie(port, publicHost, userId, logRoot = LOG_ROOT) {
+  const token = launchToken(userId, logRoot)
   if (token === undefined) throw new Error(`launch token unavailable for ${userId}`)
   return new Promise((resolve, reject) => {
     const request = http.request({
@@ -89,13 +89,22 @@ async function bootstrapCookie(port, publicHost, userId) {
 }
 
 export class BackendManager {
-  constructor(config, logger) {
+  constructor(config, logger, options = {}) {
     this.config = config
     this.logger = logger
+    this.portOpen = options.portOpen ?? portOpen
+    this.readLaunchToken = options.launchToken
+      ?? (userId => launchToken(userId, options.logRoot))
+    this.bootstrapCookie = options.bootstrapCookie
+      ?? ((port, publicHost, userId) => bootstrapCookie(
+        port, publicHost, userId, options.logRoot,
+      ))
+    this.execFile = options.execFile ?? execFileAsync
     this.states = new Map(config.users.map(user => [user.id, {
       user,
       cookie: undefined,
       lastUsed: Date.now(),
+      refreshing: undefined,
       starting: undefined,
       stopping: false,
     }]))
@@ -117,11 +126,9 @@ export class BackendManager {
     const state = this.state(userId)
     if (!state.user.enabled) throw new Error(`user is disabled: ${userId}`)
     state.lastUsed = Date.now()
-    if (await portOpen(state.user.port)) {
+    if (await this.portOpen(state.user.port)) {
       if (state.cookie === undefined) {
-        state.cookie = await this.waitForBootstrap(
-          state, traceId, 15_000, 'backend_cookie_refresh',
-        )
+        await this.refreshCookie(userId, traceId)
       }
       return state
     }
@@ -134,35 +141,75 @@ export class BackendManager {
     return state
   }
 
-  async refreshCookie(userId) {
+  async refreshCookie(userId, traceId) {
     const state = this.state(userId)
-    state.cookie = await bootstrapCookie(
-      state.user.port, this.config.publicHost, state.user.id,
-    )
+    if (state.refreshing === undefined) {
+      state.refreshing = this.refreshCookieInternal(state, traceId).finally(() => {
+        state.refreshing = undefined
+      })
+    }
+    await state.refreshing
     return state
   }
 
+  async refreshCookieInternal(state, traceId) {
+    if (this.readLaunchToken(state.user.id) !== undefined) {
+      try {
+        state.cookie = await this.bootstrapCookie(
+          state.user.port, this.config.publicHost, state.user.id,
+        )
+        return
+      } catch (error) {
+        this.logger.warn('retry_scheduled', {
+          traceId,
+          job: 'backend_cookie_refresh',
+          userId: state.user.id,
+          error_type: error?.name ?? 'Error',
+          reason: 'launch_token_bootstrap_failed',
+        })
+      }
+    }
+    await this.bootstrapService(
+      state,
+      traceId,
+      'restart',
+      'launch_token_unavailable',
+      'backend_cookie_refresh',
+    )
+  }
+
   async start(state, traceId) {
+    await this.bootstrapService(
+      state,
+      traceId,
+      'start',
+      'backend_missing',
+      'backend_start',
+    )
+  }
+
+  async bootstrapService(state, traceId, action, reason, job) {
     const unit = `deepseek-harness-user@${state.user.id}.service`
     this.logger.info('job_started', {
-      traceId, job: 'backend_start', userId: state.user.id, port: state.user.port,
-      reason: 'backend_missing',
+      traceId, job, userId: state.user.id, port: state.user.port,
+      reason,
     })
     try {
-      await execFileAsync('/usr/bin/systemctl', ['--user', 'start', unit])
+      await this.execFile('/usr/bin/systemctl', ['--user', action, unit])
+      state.cookie = undefined
       const startedAt = Date.now()
       state.cookie = await this.waitForBootstrap(
-        state, traceId, this.config.startTimeoutMs, 'backend_start',
+        state, traceId, this.config.startTimeoutMs, job,
       )
       this.logger.info('job_succeeded', {
-        traceId, job: 'backend_start', userId: state.user.id,
+        traceId, job, userId: state.user.id,
         duration_ms: Date.now() - startedAt,
       })
     } catch (error) {
       this.logger.error('job_failed', {
-        traceId, job: 'backend_start', userId: state.user.id,
+        traceId, job, userId: state.user.id,
         error_type: error?.name ?? 'Error',
-        reason: 'backend_start_failed',
+        reason: `${job}_failed`,
       })
       throw error
     }
@@ -172,9 +219,10 @@ export class BackendManager {
     const deadline = Date.now() + timeoutMs
     let lastError
     while (Date.now() < deadline) {
-      if (await portOpen(state.user.port) && launchToken(state.user.id) !== undefined) {
+      if (await this.portOpen(state.user.port)
+        && this.readLaunchToken(state.user.id) !== undefined) {
         try {
-          return await bootstrapCookie(
+          return await this.bootstrapCookie(
             state.user.port, this.config.publicHost, state.user.id,
           )
         } catch (error) {
@@ -196,7 +244,7 @@ export class BackendManager {
     if (state.stopping) return
     state.stopping = true
     try {
-      await execFileAsync('/usr/bin/systemctl', [
+      await this.execFile('/usr/bin/systemctl', [
         '--user', 'stop', `deepseek-harness-user@${userId}.service`,
       ])
       state.cookie = undefined
@@ -222,7 +270,7 @@ export class BackendManager {
         continue
       }
       if (now - state.lastUsed < this.config.idleMs) continue
-      if (!(await portOpen(state.user.port))) continue
+      if (!(await this.portOpen(state.user.port))) continue
       await this.stop(state.user.id, 'idle_timeout', `idle-${state.user.id}-${now}`)
       state.lastUsed = now
     }

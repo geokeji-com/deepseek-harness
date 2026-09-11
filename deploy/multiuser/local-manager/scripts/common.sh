@@ -37,13 +37,21 @@ remote() {
 }
 
 require_user() {
-  case "${1:-}" in
-    owner|member2|member3|member4|shared) ;;
-    *)
-      printf 'user must be owner, member2, member3, member4, or shared\n' >&2
-      exit 2
-      ;;
-  esac
+  local user="${1:-}"
+  if [[ "$user" == "shared" || "$user" =~ ^[a-z][a-z0-9-]{0,31}$ ]]; then
+    return 0
+  fi
+  printf 'user must be a valid member id or shared\n' >&2
+  exit 2
+}
+
+require_instance_user() {
+  local user="${1:-}"
+  if [[ "$user" =~ ^[a-z][a-z0-9-]{0,31}$ ]]; then
+    return 0
+  fi
+  printf 'logs requires a valid member id\n' >&2
+  exit 2
 }
 
 workspace_local_path() {

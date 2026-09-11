@@ -16,6 +16,12 @@ function verifyHash(password, encoded) {
   return safeEqual(actual, Buffer.from(expectedHex, 'hex'))
 }
 
+function cookieSignature(secret, user, expiresText, ip) {
+  return createHmac('sha256', secret)
+    .update(`${user.id}|${user.passwordScrypt}|${expiresText}|${ip}`)
+    .digest('base64url')
+}
+
 export class UserAuth {
   constructor(config) {
     if (!/^[A-Za-z0-9_-]{43}$/u.test(config.cookieSecret)) {
@@ -34,16 +40,17 @@ export class UserAuth {
     for (const user of this.config.users) {
       if (!user.enabled) continue
       const matched = verifyHash(password, user.passwordScrypt)
-      if (matched) selected = user.id
+      if (matched && selected === undefined) selected = user.id
     }
     return selected
   }
 
   issue(userId, ip, now = Date.now()) {
+    const user = this.config.users.find(candidate => candidate.id === userId && candidate.enabled)
+    if (user === undefined) throw new Error(`cannot issue a cookie for an unavailable user: ${userId}`)
     const expiresAt = now + this.config.cookieDays * 24 * 60 * 60 * 1000
-    const payload = `${userId}|${expiresAt}|${ip}`
-    const signature = createHmac('sha256', this.secret).update(payload).digest('base64url')
-    return `${expiresAt}.${signature}`
+    const expiresText = String(expiresAt)
+    return `${expiresAt}.${cookieSignature(this.secret, user, expiresText, ip)}`
   }
 
   verify(cookie, ip, now = Date.now()) {
@@ -58,9 +65,8 @@ export class UserAuth {
     const expiresAt = Number(expiresText)
     if (!Number.isSafeInteger(expiresAt) || expiresAt <= now) return undefined
     for (const user of this.config.users) {
-      const expected = createHmac('sha256', this.secret)
-        .update(`${user.id}|${expiresText}|${ip}`)
-        .digest('base64url')
+      if (!user.enabled) continue
+      const expected = cookieSignature(this.secret, user, expiresText, ip)
       if (safeEqual(signature, expected)) return user.id
     }
     return undefined

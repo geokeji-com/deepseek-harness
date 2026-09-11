@@ -32,21 +32,58 @@ restore_patch() {
   return 1
 }
 
+install_and_build() {
+  pnpm install --frozen-lockfile --store-dir "$HOME/.cache/pnpm/store" \
+    --fetch-timeout 120000 --fetch-retries 5
+  pnpm run build
+}
+
+rebuild_old_revision() {
+  if ! git apply --check "$PATCH_FILE"; then
+    log_event error_occurred error failed rollback_patch_check_failed
+    return 1
+  fi
+  git apply "$PATCH_FILE"
+  patch_applied=1
+  if ! install_and_build; then
+    restore_patch || true
+    return 1
+  fi
+  if ! restore_patch; then
+    return 1
+  fi
+  if [[ -n "$(git status --porcelain)" ]]; then
+    log_event error_occurred error failed rollback_repository_dirty
+    return 1
+  fi
+  return 0
+}
+
 rollback() {
   restore_patch || true
+  local rollback_ok=1
   if [[ -n "$old_commit" && "$(git rev-parse HEAD)" != "$old_commit" ]]; then
     git reset --hard "$old_commit" >/dev/null
+    if ! rebuild_old_revision; then
+      rollback_ok=0
+    fi
   fi
   if [[ "$instances_stopped" -eq 1 ]]; then
     systemctl --user restart dsh-multiuser.service >/dev/null 2>&1 || true
+  fi
+  if [[ "$rollback_ok" -eq 1 ]]; then
+    log_event job_succeeded info success rollback_completed
+  else
+    log_event error_occurred error failed rollback_incomplete
+    return 1
   fi
 }
 
 on_error() {
   local code="$1"
   trap - ERR
-  log_event job_failed error failed update_failed_and_rolled_back
-  rollback
+  log_event job_failed error failed update_failed_beginning_rollback
+  rollback || true
   exit "$code"
 }
 trap 'on_error $?' ERR
@@ -74,9 +111,7 @@ git apply --check "$PATCH_FILE"
 git apply "$PATCH_FILE"
 patch_applied=1
 
-pnpm install --frozen-lockfile --store-dir "$HOME/.cache/pnpm/store" \
-  --fetch-timeout 120000 --fetch-retries 5
-pnpm run build
+install_and_build
 restore_patch
 if [[ -n "$(git status --porcelain)" ]]; then
   log_event job_failed error failed repository_dirty_after_build
