@@ -339,6 +339,13 @@ describe('Hero chrome', () => {
     expect(brandMarkOwner.size).toBe(34)
     expect(brandMarkOwner.className).toBeTypeOf('string')
     expect(renderSlot.mock.calls[0]?.[2]?.fallback).toBeTruthy()
+
+    const fallback = renderSlot.mock.calls[0]?.[2]?.fallback
+    const fallbackView = render(<>{fallback}</>)
+    const logo = fallbackView.container.querySelector<HTMLImageElement>('img[src="/yishan-logo.png"]')
+    expect(logo).not.toBeNull()
+    expect(logo?.style.height).toBe('34px')
+    expect(logo?.style.objectFit).toBe('contain')
   })
 })
 

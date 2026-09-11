@@ -25,13 +25,13 @@ exports[`sidebar shell snapshots > renders the collapsed rail after the crossfad
             data-slot="sidebar.brand.mark"
             style="display: contents;"
           >
-            <svg
+            <img
+              alt=""
               aria-hidden="true"
-              data-content="965fe321"
-              fill="none"
-              height="17.6580310880829"
-              viewBox="0 0 23.16 17.04"
-              width="24"
+              class="yishanLogo"
+              draggable="false"
+              src="/yishan-logo.png"
+              style="height: 24px; width: auto; max-width: 100%; object-fit: contain;"
             />
           </div>
         </span>
@@ -120,13 +120,13 @@ exports[`sidebar shell snapshots > renders the expanded column (wordmark, capsul
               data-slot="sidebar.brand.mark"
               style="display: contents;"
             >
-              <svg
+              <img
+                alt=""
                 aria-hidden="true"
-                data-content="965fe321"
-                fill="none"
-                height="17.6580310880829"
-                viewBox="0 0 23.16 17.04"
-                width="24"
+                class="yishanLogo"
+                draggable="false"
+                src="/yishan-logo.png"
+                style="height: 24px; width: auto; max-width: 100%; object-fit: contain;"
               />
             </div>
           </span>
@@ -136,22 +136,7 @@ exports[`sidebar shell snapshots > renders the expanded column (wordmark, capsul
             <div
               data-slot="sidebar.brand.name"
               style="display: contents;"
-            >
-              <span
-                class="localBuildBrand"
-              >
-                <span
-                  class="localBuildTitle"
-                >
-                  DSH Local Build
-                </span>
-                <span
-                  class="buildVersion"
-                >
-                  1.2.3-rc.4-abc1234-dirty
-                </span>
-              </span>
-            </div>
+            />
           </span>
         </span>
       </button>
@@ -250,13 +235,13 @@ exports[`sidebar shell snapshots > renders the expanded column in the default lo
               data-slot="sidebar.brand.mark"
               style="display: contents;"
             >
-              <svg
+              <img
+                alt=""
                 aria-hidden="true"
-                data-content="965fe321"
-                fill="none"
-                height="17.6580310880829"
-                viewBox="0 0 23.16 17.04"
-                width="24"
+                class="yishanLogo"
+                draggable="false"
+                src="/yishan-logo.png"
+                style="height: 24px; width: auto; max-width: 100%; object-fit: contain;"
               />
             </div>
           </span>
@@ -266,22 +251,7 @@ exports[`sidebar shell snapshots > renders the expanded column in the default lo
             <div
               data-slot="sidebar.brand.name"
               style="display: contents;"
-            >
-              <span
-                class="localBuildBrand"
-              >
-                <span
-                  class="localBuildTitle"
-                >
-                  DSH 本地构建
-                </span>
-                <span
-                  class="buildVersion"
-                >
-                  1.2.3-rc.4-abc1234-dirty
-                </span>
-              </span>
-            </div>
+            />
           </span>
         </span>
       </button>

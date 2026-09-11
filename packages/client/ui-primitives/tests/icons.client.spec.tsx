@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { cleanup, render } from '@testing-library/react'
-import { afterEach, describe, expect, it } from 'vitest'
+import { cleanup, fireEvent, render } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import * as primitives from '@deepseek-ai/dsh-client-ui-primitives'
 import {
   IconAlarmClockOutline16, IconApiOutline14, IconArchiveOutline20, IconFolderClose16,
@@ -75,6 +75,29 @@ describe('FishLogo', () => {
     expect(container.querySelectorAll('path')).toHaveLength(1)
     expect(container.innerHTML).toContain('currentColor')
     expect(container.innerHTML).not.toContain('M0 0L23.16')
+  })
+})
+
+describe('YishanLogo', () => {
+  it('renders the supplied master artwork at its native aspect ratio', () => {
+    const view = render(<primitives.YishanLogo />)
+    const logo = view.container.querySelector('img')!
+    expect(logo.getAttribute('src')).toBe('/yishan-logo.png')
+    expect(logo.style.width).toBe('auto')
+    expect(logo.style.height).toBe('24px')
+    expect(logo.style.objectFit).toBe('contain')
+
+    view.rerender(<primitives.YishanLogo size={28} />)
+    expect(logo.style.height).toBe('28px')
+    expect(logo.style.width).toBe('auto')
+    expect(logo.style.objectFit).toBe('contain')
+  })
+
+  it('forwards asset load failures to the caller', () => {
+    const onError = vi.fn()
+    const view = render(<primitives.YishanLogo onError={onError} />)
+    fireEvent.error(view.container.querySelector('img')!)
+    expect(onError).toHaveBeenCalledOnce()
   })
 })
 

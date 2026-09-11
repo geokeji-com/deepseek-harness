@@ -1,13 +1,12 @@
-/* Capsule geometry from the figma Button component (1:155 instances:
- * h36, pad 14/7, gap 4, r18; the wide New Session form is r24 at h38 —
- * owners with the wide form set their own radius/width). */
+/* Dense workbench button geometry: the source component keeps its compact
+ * height while the shared radius follows the Geokeji product language. */
 .button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 4px;
   border: none;
-  border-radius: 18px;
+  border-radius: 10px;
   cursor: pointer;
   font-size: 14px;
   line-height: 22px;
@@ -32,7 +31,12 @@
   font-size: 12px;
   line-height: 18px;
   padding: 0 10px;
-  border-radius: 14px;
+  border-radius: 8px;
+}
+
+.button:focus-visible {
+  outline: none;
+  box-shadow: var(--dsw-alias-focus-ring);
 }
 
 .primary {

@@ -5,6 +5,7 @@ import { useState } from 'react'
 import type { ReactNode, RefObject } from 'react'
 import {
   FISH_LOGO_PATH, FISH_LOGO_VIEWBOX, IconChevronDownOutline14, IconFolderClose16, IconFolderOpen16,
+  YishanLogo,
 } from '@deepseek-ai/dsh-client-ui-primitives'
 import { workspaceTitleOf } from '@deepseek-ai/dsh-util-workspace-path'
 import type { ConversationSlotProps } from '../contract/slots.ts'
@@ -125,6 +126,23 @@ function HeroFish({ hovering }: { hovering: boolean }) {
 }
 
 /**
+ * The supplied master logo for the hero. If the public asset cannot load,
+ * keep a functional brand mark rather than leaving an empty slot.
+ */
+function HeroBrandMark({ hovering }: { hovering: boolean }) {
+  const [logoFailed, setLogoFailed] = useState(false)
+  return logoFailed
+    ? <HeroFish hovering={hovering} />
+    : (
+      <YishanLogo
+        size={34}
+        className={css.fish}
+        onError={() => { setLogoFailed(true) }}
+      />
+    )
+}
+
+/**
  * Render the hero chrome (headline only; no composer, no workspace row).
  * @param props - see {@link HeroShellProps}.
  * @returns the centered hero element tree.
@@ -146,7 +164,7 @@ export function HeroShell({ t, renderSlot, children }: HeroShellProps) {
             onMouseLeave={() => { setHovering(false) }}
           >
             {renderSlot('conversation.hero.brand.mark', { size: 34, className: css.fish }, {
-              fallback: <HeroFish hovering={hovering} />,
+              fallback: <HeroBrandMark hovering={hovering} />,
             })}
           </span>
           <span className={css.titleGroup}>
