@@ -1065,6 +1065,7 @@ class JsonlSessionPersistence extends SessionPersistence {
   private currentHeader(header: {
     readonly version: number
     readonly id: string
+    readonly ownerUserId?: string
     readonly createdAt: number
     readonly cwd?: string
     readonly parentSession?: string
@@ -1080,6 +1081,7 @@ class JsonlSessionPersistence extends SessionPersistence {
     return {
       version: SESSION_FORMAT_VERSION,
       id: makeSessionId(header.id),
+      ...(header.ownerUserId === undefined ? {} : { ownerUserId: header.ownerUserId }),
       createdAt: header.createdAt,
       ...(header.cwd === undefined ? {} : { cwd: header.cwd }),
       ...(header.parentSession === undefined

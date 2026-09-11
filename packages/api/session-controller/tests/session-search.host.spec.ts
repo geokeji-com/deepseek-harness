@@ -7,6 +7,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
+import { RequestPrincipalService, toUserId } from '@deepseek-ai/dsh-client-connection'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SESSION_FORMAT_VERSION, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
@@ -27,13 +28,18 @@ function request(query: string): { query: string } {
   return { query }
 }
 
-function header(id: string, cwd: string | null = '/project'): SessionHeader {
+function header(
+  id: string,
+  cwd: string | null = '/project',
+  ownerUserId?: string,
+): SessionHeader {
   return {
     version: SESSION_FORMAT_VERSION,
     id: sid(id),
     createdAt: 100,
     isSeeded: false,
     ...(cwd === null ? {} : { cwd }),
+    ...(ownerUserId === undefined ? {} : { ownerUserId }),
   }
 }
 
@@ -94,6 +100,42 @@ function installSearchQuery(
 }
 
 describe('session.search', () => {
+  it('filters list and search results to the signed principal owner', async () => {
+    const ctx = await baseContext()
+    const memberA = header('owned-a', '/workspace-a', 'member-a')
+    const memberB = header('owned-b', '/workspace-b', 'member-b')
+    ctx.sessions.create(memberA.id, { meta: memberA })
+    ctx.sessions.create(memberB.id, { meta: memberB })
+    installSearchQuery(ctx, () => Promise.resolve({
+      items: [hit('owned-b', 1), hit('owned-a', 0)],
+    }))
+    const principals = new RequestPrincipalService(ctx, {
+      secret: 'search-owner-isolation-secret-0123456789',
+    })
+    const remote = createSessionTestRemote(ctx, defaults)
+    const memberAPrincipal = {
+      userId: toUserId('member-a'),
+      issuedAt: 1,
+      expiresAt: 2,
+    }
+
+    await expect(principals.run(memberAPrincipal, () => remote.list({}))).resolves.toMatchObject({
+      ok: true,
+      value: { items: [{ sessionId: 'owned-a' }] },
+    })
+    await expect(principals.run(
+      memberAPrincipal,
+      () => remote.search(request('match'), new AbortController().signal),
+    )).resolves.toEqual({
+      ok: true,
+      value: {
+        items: [{ sessionId: 'owned-a', snippet: 'match 0' }],
+        hasMore: false,
+      },
+    })
+    await ctx.fiber.dispose()
+  })
+
   it('rejects search when the query service is absent', async () => {
     const ctx = await baseContext()
     const list = new ApiSessionList(ctx)

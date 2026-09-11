@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest'
+import { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { ReasoningEffortId } from '@deepseek-ai/dsh-llm'
-import { Session, SessionId } from '@deepseek-ai/dsh-session'
-import { resolveChildAgentOptions } from '../src/child-agent.ts'
+import { SESSION_FORMAT_VERSION, Session, SessionId } from '@deepseek-ai/dsh-session'
+import { childSessionMeta, resolveChildAgentOptions } from '../src/child-agent.ts'
 
 function parentAgent(): Agent {
   const id = SessionId('parent')
@@ -14,11 +15,30 @@ function parentAgent(): Agent {
       reasoningEffort: ReasoningEffortId('high'),
       maxTokens: 512,
     },
-    session: Session.create(id),
+    session: Session.create(id, [], {
+      version: SESSION_FORMAT_VERSION,
+      id,
+      createdAt: Date.now(),
+      ownerUserId: 'user-a',
+      isSeeded: false,
+    }),
+    ctx: new Context(),
   } as Agent
 }
 
 describe('child Agent options', () => {
+  it('inherits the parent Session owner in child creation metadata', () => {
+    const parent = parentAgent()
+    const id = parent.session.id
+
+    expect(childSessionMeta(parent, 1, false)).toMatchObject({
+      ownerUserId: 'user-a',
+      parentSession: id,
+      delegationDepth: 1,
+      origin: 'subagent',
+    })
+  })
+
   it('inherits the parent effort while the exact route is unchanged', () => {
     expect(resolveChildAgentOptions(parentAgent(), undefined, 1)).toEqual({
       provider: 'parent-provider',

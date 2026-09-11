@@ -53,7 +53,7 @@ function agent(ctx: Context, cwd: string): Agent {
     ctx: scope.ctx,
     send: () => {},
     followup: () => {},
-    steer: () => ({ outcome: Promise.resolve({ status: 'rejected' as const }) }),
+    steer: () => {},
     inject: () => {},
     cancel() {},
     runMaintenance: task => task(new AbortController().signal),

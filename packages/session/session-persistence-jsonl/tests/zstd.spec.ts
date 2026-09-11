@@ -411,7 +411,7 @@ describe('JsonlSessionPersistence: default Zstandard encoding', () => {
     expect((await readAll(ctx.sessionPersistence, header.id)).events).toEqual(oneTurnLog())
   })
 
-  it('serves a migrated compressed v0 read without publishing a successor', async () => {
+  it('refuses a compressed v0 read without publishing a successor', async () => {
     const root = await freshRoot()
     const ctx = await mount(root)
     const header = meta('zstd-v0-read', '/work')
@@ -429,25 +429,8 @@ describe('JsonlSessionPersistence: default Zstandard encoding', () => {
     await mkdir(sessionDir(root, header.cwd, header.id), { recursive: true })
     await writeFile(sourcePath, source)
 
-    await expect(readAll(ctx.sessionPersistence, header.id)).resolves.toEqual({
-      meta: { ...header, delegationDepth: 0 },
-      events: [
-        historical[0],
-        historical[1],
-        {
-          type: 'system/message', seq: 2, time: 2, surfaceOp: 'append',
-          data: {
-            turn: 1, step: 1,
-            message: {
-              id: 'v2-to-v3-system-fc06c3f7720f3bc94ea7a2b7fadde6a5b100c6ab6ca342d2222bd017184a0b67',
-              role: 'system', source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt' }, content: [],
-            },
-          },
-        },
-        { ...historical[2], seq: 3 },
-        ...oneTurnLog().slice(3).map(event => ({ ...event, seq: event.seq + 1 })),
-      ],
-    })
+    await expect(readAll(ctx.sessionPersistence, header.id))
+      .rejects.toThrow('owner-aware migration tool')
     expect(await readFile(sourcePath)).toEqual(source)
     await expect(readFile(currentPath)).rejects.toMatchObject({ code: 'ENOENT' })
   })

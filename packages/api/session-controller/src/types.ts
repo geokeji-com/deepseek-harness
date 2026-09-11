@@ -192,6 +192,10 @@ declare module '@deepseek-ai/dsh-typert-protocol' {
       readonly existingCwd?: string
     }
     'session/agent-busy': { readonly reason: string }
+    'gateway/overloaded': {
+      readonly reason: 'queue-full' | 'timeout' | 'cancelled' | 'agent-pool'
+      readonly retryAfterMs: number
+    }
     'session/invalid-time-zone': { readonly value: string }
     'session/workspace-attach-failed': { readonly sessionId: SessionId; readonly workspaceId: string }
     'agent-preset/conflict': {

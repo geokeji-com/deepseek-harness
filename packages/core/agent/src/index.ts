@@ -82,6 +82,7 @@ export interface CreateAgentOptions {
     readonly origin?: 'subagent'
     readonly delegationDepth?: number
     readonly agentPreset?: string
+    readonly ownerUserId?: string
   }
   /** Exact fork-inherited prefix length when the session metadata sets `isSeeded`. */
   readonly inheritedEventCount?: SessionLogOffset
@@ -162,6 +163,48 @@ export interface AgentHandle {
   dispose(): Promise<void>
 }
 
+/** Shared live-Agent pool exhaustion. */
+export class AgentPoolCapacityError extends Error {
+  /** Stable Remote error code for callers at the HTTP boundary. */
+  readonly code = 'gateway/overloaded'
+
+  /**
+   * @param isChild - whether the rejected creation was an Agent child.
+   * @param retryAfterMs - advisory delay before retrying.
+   */
+  constructor(
+    readonly isChild: boolean,
+    readonly retryAfterMs = 5_000,
+  ) {
+    super(isChild
+      ? 'the shared Agent pool has no emergency child slot available'
+      : 'the shared Agent pool has reached its top-level capacity')
+    this.name = 'AgentPoolCapacityError'
+  }
+}
+
+/** Shared turn scheduler saturation or timeout. */
+export class AgentTurnOverloadedError extends Error {
+  /** Stable Remote error code for callers at the HTTP boundary. */
+  readonly code = 'gateway/overloaded'
+
+  /**
+   * @param reason - queue saturation or timeout category.
+   * @param retryAfterMs - advisory delay before retrying.
+   */
+  constructor(
+    readonly reason: 'queue-full' | 'timeout' | 'cancelled',
+    readonly retryAfterMs = 5_000,
+  ) {
+    super(reason === 'queue-full'
+      ? 'the shared Agent turn queue is full'
+      : reason === 'timeout'
+        ? 'the shared Agent turn queue wait timed out'
+        : 'the shared Agent turn queue request was cancelled')
+    this.name = 'AgentTurnOverloadedError'
+  }
+}
+
 /**
  * The agent-creation factory the loop implementation provides to the registry
  * via {@link AgentRegistry.setFactory}. Kept on the `dsh-agent` interface so
@@ -230,6 +273,27 @@ interface FactorySlot {
   readonly target: AgentFactory
 }
 
+interface AgentPoolEntry {
+  readonly agent: Agent
+  readonly topLevel: boolean
+  evictable: boolean
+  dispose: () => Promise<void>
+  lastActiveAt: number
+  disposal?: Promise<void>
+}
+
+interface AgentPoolReservation {
+  readonly id: SessionId
+  readonly child: boolean
+  consumed: boolean
+}
+
+const AGENT_POOL_LIMIT = 64
+const AGENT_POOL_CHILD_RESERVE = 8
+const AGENT_POOL_TOP_LEVEL_LIMIT = AGENT_POOL_LIMIT - AGENT_POOL_CHILD_RESERVE
+const AGENT_POOL_IDLE_MS = 30 * 60 * 1_000
+const AGENT_POOL_MAINTENANCE_MS = 60_000
+
 /**
  * Agent service (`ctx.agents`): tracks live agents and carries the initiating
  * Agent through one process-local asynchronous driver chain. Agent *creation*
@@ -251,6 +315,13 @@ export class AgentRegistry extends Service {
   private activeInitiatorRuns = 0
   private initiatorDrain: PromiseWithResolvers<void> | undefined
   private initiatorDisposal: Promise<void> | undefined
+  private readonly pool = new Map<SessionId, AgentPoolEntry>()
+  private poolTopLevelReservations = 0
+  private poolChildReservations = 0
+  private readonly poolReservations = new Map<SessionId, AgentPoolReservation[]>()
+  private poolTail: Promise<void> = Promise.resolve()
+  private poolTimer: ReturnType<typeof setInterval> | undefined
+  private poolEvictions = 0
 
   constructor(ctx: Context) {
     super(ctx, 'agents')
@@ -277,6 +348,17 @@ export class AgentRegistry extends Service {
       yield () => this.disposeInitiators()
       yield () => { this.closeInitiators() }
     }.bind(this), 'agents.initiatorLifecycle()')
+    ctx.on('agent/status', ({ agent }) => { this.touchPooled(agent) }, { global: true })
+    ctx.on('agent/assistant-stream', ({ agent }) => { this.touchPooled(agent) }, { global: true })
+    ctx.on('agent/error', ({ agent }) => { this.touchPooled(agent) }, { global: true })
+    ctx.on('agent/disposed', ({ agent }) => { this.pool.delete(agent.id) }, { global: true })
+    ctx.on('session/event', (session) => { this.touchPooled(session.id) }, { global: true })
+    this.poolTimer = setInterval(() => { void this.maintainPool() }, AGENT_POOL_MAINTENANCE_MS)
+    this.poolTimer.unref()
+    ctx.effect(() => () => {
+      if (this.poolTimer !== undefined) clearInterval(this.poolTimer)
+      this.poolTimer = undefined
+    }, 'agents.poolMaintenance()')
   }
 
   /**
@@ -387,14 +469,21 @@ export class AgentRegistry extends Service {
    */
   async create(options: CreateAgentOptions): Promise<AgentHandle> {
     const ownerCtx = this.ctx
-    // Re-trace a Service-backed factory through the accessing context
-    // explicitly. This preserves AgentLoop's dependency origin while binding
-    // its effects to ownerCtx; plain factories receive ownerCtx as an explicit
-    // capability and need no Cordis tracker magic.
-    const { target } = this.requireFactory()
-    const receiver = getTraceable(ownerCtx, target)
-    // oxlint-disable-next-line typescript/unbound-method -- Reflect.apply intentionally supplies the caller-traced receiver
-    return Reflect.apply(target.createAgent, receiver, [ownerCtx, options])
+    const child = options.parentAgent !== undefined
+    const reservation = await this.reservePoolSlot(options.sessionId, child)
+    try {
+      // Re-trace a Service-backed factory through the accessing context
+      // explicitly. This preserves AgentLoop's dependency origin while binding
+      // its effects to ownerCtx; plain factories receive ownerCtx as an explicit
+      // capability and need no Cordis tracker magic.
+      const { target } = this.requireFactory()
+      const receiver = getTraceable(ownerCtx, target)
+      // oxlint-disable-next-line typescript/unbound-method -- Reflect.apply intentionally supplies the caller-traced receiver
+      const handle = await Reflect.apply(target.createAgent, receiver, [ownerCtx, options])
+      return this.trackPooledHandle(handle, !child)
+    } finally {
+      this.releasePoolReservation(reservation)
+    }
   }
 
   /**
@@ -406,10 +495,17 @@ export class AgentRegistry extends Service {
    */
   async resume(options: ResumeAgentOptions): Promise<AgentHandle> {
     const ownerCtx = this.ctx
-    const { target } = this.requireFactory()
-    const receiver = getTraceable(ownerCtx, target)
-    // oxlint-disable-next-line typescript/unbound-method -- Reflect.apply intentionally supplies the caller-traced receiver
-    return Reflect.apply(target.resume, receiver, [ownerCtx, options])
+    const child = options.parentAgent !== undefined
+    const reservation = await this.reservePoolSlot(options.resumeSessionId, child)
+    try {
+      const { target } = this.requireFactory()
+      const receiver = getTraceable(ownerCtx, target)
+      // oxlint-disable-next-line typescript/unbound-method -- Reflect.apply intentionally supplies the caller-traced receiver
+      const handle = await Reflect.apply(target.resume, receiver, [ownerCtx, options])
+      return this.trackPooledHandle(handle, !child)
+    } finally {
+      this.releasePoolReservation(reservation)
+    }
   }
 
   /**
@@ -455,10 +551,14 @@ export class AgentRegistry extends Service {
    *   synchronous `agent/created` listener, removal and disposal wait until
    *   that creation dispatch unwinds.
    */
-  enter(agent: Agent, owner: Agent | undefined): () => void {
+  enter(agent: Agent, owner: Agent | undefined, dispose?: () => Promise<void>): () => void {
     const id = agent.id
     if (id !== agent.session.id) {
       throw new Error(`agent id "${id}" does not match session id "${agent.session.id}"`)
+    }
+    const reserved = this.consumePoolReservation(id, owner !== undefined)
+    if (!reserved && !this.admitPoolSlotSync(owner !== undefined)) {
+      throw new AgentPoolCapacityError(owner !== undefined)
     }
     const carrier = scopeTarget(agent, agent)
     // This is the authoritative collision boundary. Concurrent create/resume
@@ -474,6 +574,13 @@ export class AgentRegistry extends Service {
       detachRequested: false,
     }
     this.store.set(id, entry)
+    this.pool.set(id, {
+      agent,
+      topLevel: owner === undefined,
+      evictable: owner === undefined && dispose !== undefined,
+      dispose: dispose ?? (async () => {}),
+      lastActiveAt: Date.now(),
+    })
     let entered = true
     const detach = (): void => {
       if (!entered) return
@@ -500,6 +607,7 @@ export class AgentRegistry extends Service {
     /* v8 ignore next -- enter() rejects replacement while this single-shot detach capability is live. */
     if (this.store.get(entry.id) !== entry) return
     this.store.delete(entry.id)
+    this.pool.delete(entry.id)
     // An insertion rolled back before announce was never externally created,
     // so emitting disposed would invent an impossible lifecycle edge. Marking
     // happens before the created emit: if a later created listener throws,
@@ -598,6 +706,162 @@ export class AgentRegistry extends Service {
     return [...this.store.values()]
       .filter(entry => entry.owner === undefined)
       .map(entry => entry.agent)
+  }
+
+  /**
+   * Read a point-in-time view of shared Agent residency.
+   * @returns resident, running, idle, cumulative eviction, and queued counts.
+   */
+  poolMetrics(): {
+    readonly resident: number
+    readonly running: number
+    readonly idle: number
+    readonly evicted: number
+    readonly queued: number
+  } {
+    const entries = [...this.pool.values()]
+    const running = entries.filter(entry => entry.agent.status === 'running').length
+    return {
+      resident: entries.length,
+      running,
+      idle: entries.length - running,
+      evicted: this.poolEvictions,
+      queued: 0,
+    }
+  }
+
+  private reservePoolSlot(id: SessionId, child: boolean): Promise<AgentPoolReservation> {
+    let reservation: AgentPoolReservation | undefined
+    const admitted = this.poolTail.then(async () => {
+      await this.admitPoolSlot(child)
+      reservation = { id, child, consumed: false }
+      const entries = this.poolReservations.get(id) ?? []
+      entries.push(reservation)
+      this.poolReservations.set(id, entries)
+    })
+    this.poolTail = admitted.catch(() => {})
+    return admitted.then(() => reservation as AgentPoolReservation)
+  }
+
+  private async admitPoolSlot(child: boolean): Promise<void> {
+    while (true) {
+      const entries = [...this.pool.values()]
+      const total = entries.length + this.poolTopLevelReservations + this.poolChildReservations
+      const topLevel = entries.filter(entry => entry.topLevel).length + this.poolTopLevelReservations
+      const admitted = child
+        ? total < AGENT_POOL_LIMIT
+        : total < AGENT_POOL_LIMIT && topLevel < AGENT_POOL_TOP_LEVEL_LIMIT
+      if (admitted) {
+        if (child) this.poolChildReservations += 1
+        else this.poolTopLevelReservations += 1
+        return
+      }
+      if (!await this.evictOneIdleTopLevel()) throw new AgentPoolCapacityError(child)
+    }
+  }
+
+  private consumePoolReservation(id: SessionId, child: boolean): boolean {
+    const entries = this.poolReservations.get(id)
+    const reservation = entries?.shift()
+    if (entries?.length === 0) this.poolReservations.delete(id)
+    if (reservation === undefined) return false
+    if (reservation.child !== child) {
+      this.releasePoolReservation(reservation)
+      throw new Error(`agent pool reservation kind mismatch for "${id}"`)
+    }
+    reservation.consumed = true
+    if (child) this.poolChildReservations = Math.max(0, this.poolChildReservations - 1)
+    else this.poolTopLevelReservations = Math.max(0, this.poolTopLevelReservations - 1)
+    return true
+  }
+
+  private releasePoolReservation(reservation: AgentPoolReservation): void {
+    if (reservation.consumed) return
+    reservation.consumed = true
+    const entries = this.poolReservations.get(reservation.id)
+    const index = entries?.indexOf(reservation) ?? -1
+    if (entries !== undefined && index !== -1) entries.splice(index, 1)
+    if (entries?.length === 0) this.poolReservations.delete(reservation.id)
+    if (reservation.child) this.poolChildReservations = Math.max(0, this.poolChildReservations - 1)
+    else this.poolTopLevelReservations = Math.max(0, this.poolTopLevelReservations - 1)
+  }
+
+  private admitPoolSlotSync(child: boolean): boolean {
+    const entries = [...this.pool.values()]
+    const total = entries.length + this.poolTopLevelReservations + this.poolChildReservations
+    const topLevel = entries.filter(entry => entry.topLevel).length + this.poolTopLevelReservations
+    return child
+      ? total < AGENT_POOL_LIMIT
+      : total < AGENT_POOL_LIMIT && topLevel < AGENT_POOL_TOP_LEVEL_LIMIT
+  }
+
+  private trackPooledHandle(handle: AgentHandle, topLevel: boolean): AgentHandle {
+    const entry = this.pool.get(handle.agent.id) ?? {
+      agent: handle.agent,
+      topLevel,
+      evictable: true,
+      dispose: () => handle.dispose(),
+      lastActiveAt: Date.now(),
+    }
+    entry.evictable = true
+    entry.dispose = () => handle.dispose()
+    this.pool.set(handle.agent.id, entry)
+    this.touchPooled(handle.agent)
+    return {
+      agent: handle.agent,
+      dispose: () => this.disposePooled(entry),
+    }
+  }
+
+  private disposePooled(entry: AgentPoolEntry): Promise<void> {
+    return (entry.disposal ??= (async () => {
+      this.pool.delete(entry.agent.id)
+      await entry.dispose()
+    })())
+  }
+
+  private async evictOneIdleTopLevel(): Promise<boolean> {
+    const candidate = [...this.pool.values()]
+      .filter(entry => this.isEvictable(entry))
+      .sort((left, right) => left.lastActiveAt - right.lastActiveAt)[0]
+    if (candidate === undefined) return false
+    this.poolEvictions += 1
+    await this.disposePooled(candidate)
+    return true
+  }
+
+  private isEvictable(entry: AgentPoolEntry): boolean {
+    if (!entry.evictable || !entry.topLevel || entry.disposal !== undefined) return false
+    if (entry.agent.status !== 'idle') return false
+    if (entry.agent.inbox.nextTurn.length > 0 || entry.agent.inbox.nextStep.length > 0) return false
+    return ![...this.store.values()].some(child => child.owner?.id === entry.agent.id)
+  }
+
+  private touchPooled(subject: Agent | SessionId): void {
+    const id = typeof subject === 'string' ? subject : subject.id
+    const entry = this.pool.get(id)
+    if (entry === undefined) return
+    entry.lastActiveAt = Date.now()
+    const owner = this.store.get(id)?.owner
+    if (owner !== undefined) {
+      const parent = this.pool.get(owner.id)
+      if (parent !== undefined) parent.lastActiveAt = entry.lastActiveAt
+    }
+  }
+
+  private async maintainPool(): Promise<void> {
+    const cutoff = Date.now() - AGENT_POOL_IDLE_MS
+    for (const entry of [...this.pool.values()]
+      .filter(item => this.isEvictable(item) && item.lastActiveAt <= cutoff)
+      .sort((left, right) => left.lastActiveAt - right.lastActiveAt)) {
+      try {
+        await this.disposePooled(entry)
+        this.poolEvictions += 1
+      } catch (error: unknown) {
+        this.ctx.logger.warn(`agents: idle eviction failed for "${entry.agent.id}": ${String(error)}`)
+      }
+    }
+    this.ctx.logger.info(`agents: shared pool ${JSON.stringify(this.poolMetrics())}`)
   }
 
   /** Reject new initiator boundaries while inherited continuations drain. */

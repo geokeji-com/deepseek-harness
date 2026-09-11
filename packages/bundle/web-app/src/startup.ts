@@ -29,6 +29,8 @@ export interface WebStartupValues {
   port?: number
   /** Explicit `--trusted-host` authorities, in argument order. */
   trustedHosts: string[]
+  /** Proxy-signed identity secret; absent keeps local-only compatibility. */
+  requestPrincipalSecret?: string
 }
 
 /** The web flag family, as commander parsed it. */
@@ -82,6 +84,10 @@ export function apply(ctx: Context): void {
       ...options.host !== undefined && { host: options.host },
       ...options.port !== undefined && { port: Number(options.port) },
       trustedHosts: options.trustedHost ?? [],
+      ...(process.env.DSH_REQUEST_PRINCIPAL_SECRET === undefined
+        || process.env.DSH_REQUEST_PRINCIPAL_SECRET.length === 0
+        ? {}
+        : { requestPrincipalSecret: process.env.DSH_REQUEST_PRINCIPAL_SECRET }),
     } satisfies WebStartupValues)
   })
   parseCmdline(ctx, program)

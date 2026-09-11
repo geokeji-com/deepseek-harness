@@ -85,7 +85,7 @@ export type OptionalSessionSeq = SessionSeq | null
  * immutable prior-generation, and current fast-path rules are recorded in
  * `.agents/notes/implemented/architecture/2026-08-31-released-session-format-migrations.md`.
  */
-export const SESSION_FORMAT_VERSION = 3
+export const SESSION_FORMAT_VERSION = 4
 
 /**
  * Immutable validated storage metadata, kept outside the conversation event log.
@@ -98,6 +98,12 @@ export interface SessionHeader {
   readonly version: typeof SESSION_FORMAT_VERSION
   /** The session's id (mirrors the {@link Session}'s id). */
   readonly id: SessionId
+  /**
+   * Authenticated owner of this Session. Optional only for local-only
+   * deployments that disable request principals; shared deployments persist
+   * this value on every top-level, fork, resume, and subagent path.
+   */
+  readonly ownerUserId?: string
   /** Non-negative safe-integer Unix epoch milliseconds when the session was created. */
   readonly createdAt: number
   /** Absolute working directory the session was created in (if any). */
@@ -148,6 +154,7 @@ export interface CreateSessionOptions {
    * lineage; supplying replay history alone does not make it inherited.
    */
   readonly meta?: {
+    readonly ownerUserId?: string
     readonly cwd?: string
     readonly parentSession?: SessionId
     readonly createdAt?: number

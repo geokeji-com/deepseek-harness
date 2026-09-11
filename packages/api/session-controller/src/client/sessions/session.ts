@@ -318,8 +318,12 @@ export class Session implements SessionFace {
   }
 
   /** Apply one operation to a still-pending queue occurrence. */
-  async updateQueue(itemId: MessageId, action: QueueAction): Promise<RemoteResult<{ accepted: true }>> {
-    return this.remote.session.updateQueue({ sessionId: this.sessionId, itemId, action })
+  async updateQueue(
+    itemId: MessageId,
+    action: QueueAction,
+    signal?: AbortSignal,
+  ): Promise<RemoteResult<{ accepted: true }>> {
+    return this.remote.session.updateQueue({ sessionId: this.sessionId, itemId, action }, signal)
   }
 
   /**

@@ -586,9 +586,13 @@ describe('subagent ownership fence', () => {
       clientTimeZone: alias,
     })
     await expect(remote.prompt(zonedRequest)).resolves.toMatchObject({ ok: true })
-    expect(followup).toHaveBeenNthCalledWith(1, expect.objectContaining({
-      source: { kind: 'user', rpcId: zonedRequest.requestId, clientTimeZone: canonical },
-    }))
+    expect(followup).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({
+        source: { kind: 'user', rpcId: zonedRequest.requestId, clientTimeZone: canonical },
+      }),
+      expect.anything(),
+    )
 
     const utcRequest = promptRequest({
       sessionId: agent.id,
@@ -597,9 +601,13 @@ describe('subagent ownership fence', () => {
       clientTimeZone: 'UTC',
     })
     await expect(remote.prompt(utcRequest)).resolves.toMatchObject({ ok: true })
-    expect(followup).toHaveBeenNthCalledWith(2, expect.objectContaining({
-      source: { kind: 'user', rpcId: utcRequest.requestId, clientTimeZone: 'UTC' },
-    }))
+    expect(followup).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({
+        source: { kind: 'user', rpcId: utcRequest.requestId, clientTimeZone: 'UTC' },
+      }),
+      expect.anything(),
+    )
 
     const unzonedRequest = promptRequest({
       sessionId: agent.id,
@@ -607,9 +615,13 @@ describe('subagent ownership fence', () => {
       content: [{ type: 'text' as const, text: 'headless work' }],
     })
     await expect(remote.prompt(unzonedRequest)).resolves.toMatchObject({ ok: true })
-    expect(followup).toHaveBeenNthCalledWith(3, expect.objectContaining({
-      source: { kind: 'user', rpcId: unzonedRequest.requestId },
-    }))
+    expect(followup).toHaveBeenNthCalledWith(
+      3,
+      expect.objectContaining({
+        source: { kind: 'user', rpcId: unzonedRequest.requestId },
+      }),
+      expect.anything(),
+    )
 
     for (const clientTimeZone of ['', ' UTC', 'CST', 'Not/A_Real_Zone']) {
       const invalid = await remote.prompt(promptRequest({
@@ -761,16 +773,19 @@ describe('sessions.prompt synchronous rejection', () => {
     expect(queued).toMatchObject({ ok: true, value: { accepted: true } })
     expect(steered).toMatchObject({ ok: true, value: { accepted: true } })
     expect(imageQueued).toMatchObject({ ok: true, value: { accepted: true } })
-    expect(followup).toHaveBeenCalledWith(expect.objectContaining({
-      content: [{ type: 'text', text: ' queued ' }],
-    }))
-    expect(steer).toHaveBeenCalledWith(expect.objectContaining({
-      content: [{ type: 'text', text: 'steered' }],
-    }))
+    expect(followup).toHaveBeenCalledWith(
+      expect.objectContaining({ content: [{ type: 'text', text: ' queued ' }] }),
+      expect.anything(),
+    )
+    expect(steer).toHaveBeenCalledWith(
+      expect.objectContaining({ content: [{ type: 'text', text: 'steered' }] }),
+      expect.anything(),
+    )
     expect(saveImages).toHaveBeenCalledOnce()
-    expect(followup).toHaveBeenCalledWith(expect.objectContaining({
-      content: [{ type: 'image', attachment: savedImage }],
-    }))
+    expect(followup).toHaveBeenCalledWith(
+      expect.objectContaining({ content: [{ type: 'image', attachment: savedImage }] }),
+      expect.anything(),
+    )
     await ctx.fiber.dispose()
   })
 

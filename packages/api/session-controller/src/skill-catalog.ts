@@ -7,6 +7,7 @@ import { SessionQueryError } from '@deepseek-ai/dsh-session-query'
 import { isUserInvocable } from '@deepseek-ai/dsh-skill'
 import type { ScopeKey } from '@deepseek-ai/dsh-scope'
 import { Remote, RemoteError, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
+import { principalOwns, requestPrincipalOf, sessionNotFound } from './authorization.ts'
 import type { SkillListRequest, SkillListValue } from './types.ts'
 
 declare module '@deepseek-ai/cordis' {
@@ -40,6 +41,9 @@ export class SessionSkillCatalog extends TypertRemoteService {
     let agentPreset: string | undefined
     try {
       using observation = await this.ctx.sessionQuery.observeSession(sessionId)
+      if (!principalOwns(requestPrincipalOf(this.ctx), observation.header.ownerUserId)) {
+        throw sessionNotFound(sessionId)
+      }
       if (observation.projections === undefined) {
         throw new Error('skill catalog requires a projected Session observation')
       }
@@ -50,6 +54,7 @@ export class SessionSkillCatalog extends TypertRemoteService {
         && error.code === 'SESSION_QUERY_SESSION_NOT_FOUND') {
         throw new RemoteError('session/not-found', `session "${sessionId}" not found`, { sessionId })
       }
+      if (error instanceof RemoteError) throw error
       throw new RemoteError(
         'gateway/internal',
         `session "${sessionId}" could not be inspected: ${String(error)}`,

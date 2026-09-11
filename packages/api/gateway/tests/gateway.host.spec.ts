@@ -3,8 +3,12 @@ import type { AddressInfo } from 'node:net'
 import { describe, expect, it } from 'vitest'
 import { Context, Service, symbols } from '@deepseek-ai/cordis'
 import { z } from 'zod'
-import { apply as applyConnection, inject as connectionInject } from '@deepseek-ai/dsh-client-connection'
-import type { HostConnectionHandle } from '@deepseek-ai/dsh-client-connection'
+import {
+  apply as applyConnection,
+  inject as connectionInject,
+  toUserId,
+} from '@deepseek-ai/dsh-client-connection'
+import type { HostConnectionHandle, RequestPrincipal } from '@deepseek-ai/dsh-client-connection'
 import type { WebServer, WebRoute } from '@deepseek-ai/dsh-host-webserver'
 import {
   bindTypertRemote,
@@ -17,7 +21,12 @@ import {
   type TypertLookupProvider,
 } from '@deepseek-ai/dsh-typert-protocol'
 import TypertRegistry, { type TypertContribution } from '@deepseek-ai/dsh-typert-registry'
-import TypertGatewayService, { TypertGatewayError } from '@deepseek-ai/dsh-api-gateway'
+import TypertGatewayService, {
+  TypertGatewayError,
+  type TypertRemoteEventDispatch,
+  type TypertRemoteEventInvocation,
+  type TypertRemoteEventOutcome,
+} from '@deepseek-ai/dsh-api-gateway'
 import { provideBrowserCredentials } from './browser-credentials.ts'
 
 interface FixtureAgent {
@@ -106,7 +115,12 @@ type FakeRpcResult =
   | { readonly ok: true; readonly value: unknown }
   | { readonly ok: false; readonly error: { readonly code: string; readonly message: string; readonly details: object } }
 
-type FakeRpcHandler = (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<FakeRpcResult>
+type FakeRpcHandler = (
+  endpoint: string,
+  payload: unknown,
+  signal: AbortSignal,
+  principal?: RequestPrincipal,
+) => Promise<FakeRpcResult>
 
 class FakeConnectionService extends Service {
   channel: string | undefined
@@ -1118,6 +1132,145 @@ describe('TypertGatewayService', () => {
     await ctx.fiber.dispose()
   })
 
+  it('isolates forwarded Remote events and results by principal', async () => {
+    const ctx = new Context()
+    await ctx.plugin(TypertRegistry)
+    await ctx.plugin(FakeConnectionService)
+    await ctx.plugin(TypertGatewayService)
+    const handler = rawConnection(ctx).handler
+    if (handler === undefined) throw new Error('fixture Connection did not retain the /api interceptor')
+
+    const agent = ctx.extend()
+    const subject = { id: 'agent-owner-a' }
+    const settled = Promise.withResolvers<TypertRemoteEventOutcome>()
+    const start = Promise.withResolvers<undefined>()
+    let settledResult = false
+    const pending: TypertRemoteEventInvocation = {
+      event: 'fixture/approval',
+      request: { prompt: 'owner-only', agent: subject },
+      context: {
+        value: agent,
+        subject,
+        agentId: 'agent-owner-a',
+        ownerUserId: 'member-a',
+      },
+      resolve: (outcome) => {
+        settledResult = true
+        settled.resolve(outcome)
+      },
+      reject: (reason) => { settled.reject(reason) },
+    }
+    const source = (signal: AbortSignal): AsyncIterable<TypertRemoteEventDispatch> => (async function* () {
+      await start.promise
+      yield { event: 'fixture/changed-a', args: ['member-a'], ownerUserId: 'member-a' }
+      yield { event: 'fixture/changed-public', args: ['everyone'] }
+      yield pending
+      await new Promise<void>((resolve) => {
+        if (signal.aborted) resolve()
+        else signal.addEventListener('abort', () => { resolve() }, { once: true })
+      })
+    })()
+    const unregister = ctx.typertGateway.registerRemoteEvents(source, { home: '/home/fixture' })
+    const now = Date.now()
+    const principalA: RequestPrincipal = {
+      userId: toUserId('member-a'),
+      issuedAt: now,
+      expiresAt: now + 60_000,
+    }
+    const principalB: RequestPrincipal = {
+      userId: toUserId('member-b'),
+      issuedAt: now,
+      expiresAt: now + 60_000,
+    }
+    const carrierA = new AbortController()
+    const carrierB = new AbortController()
+    const eventsA = rawGatewayEventHarness(ctx).openRemoteEvents({ args: {} }, carrierA.signal, principalA)
+    const eventsB = rawGatewayEventHarness(ctx).openRemoteEvents({ args: {} }, carrierB.signal, principalB)
+
+    const readyA = await eventsA.next()
+    expect(readyA).toMatchObject({ done: false, value: { type: 'ready' } })
+    if (readyA.done) throw new Error('member-a event stream ended before ready')
+    const clientIdA: unknown = Reflect.get(readyA.value as object, 'clientId')
+    if (typeof clientIdA !== 'string') throw new Error('member-a event stream omitted its Client id')
+
+    await expect(eventsB.next()).resolves.toMatchObject({
+      done: false,
+      value: { type: 'ready' },
+    })
+    start.resolve(undefined)
+
+    await expect(eventsA.next()).resolves.toMatchObject({
+      done: false,
+      value: { type: 'emit', event: 'fixture/changed-a', args: ['member-a'] },
+    })
+    await expect(eventsA.next()).resolves.toMatchObject({
+      done: false,
+      value: { type: 'emit', event: 'fixture/changed-public', args: ['everyone'] },
+    })
+    const invocationA = await eventsA.next()
+    expect(invocationA).toMatchObject({
+      done: false,
+      value: {
+        type: 'waterfall',
+        event: 'fixture/approval',
+        agentId: 'agent-owner-a',
+        request: { prompt: 'owner-only' },
+      },
+    })
+    if (invocationA.done) throw new Error('member-a event stream ended before its waterfall')
+    const eventId = typeof invocationA.value === 'object' && invocationA.value !== null
+      && 'eventId' in invocationA.value
+      ? invocationA.value.eventId
+      : undefined
+    if (typeof eventId !== 'string') throw new Error('member-a waterfall omitted its event id')
+
+    await expect(eventsB.next()).resolves.toMatchObject({
+      done: false,
+      value: { type: 'emit', event: 'fixture/changed-public', args: ['everyone'] },
+    })
+    const pendingB = eventsB.next()
+    const leaked = await Promise.race([
+      pendingB.then(() => 'delivered'),
+      new Promise<'idle'>((resolve) => { setTimeout(() => { resolve('idle') }, 20) }),
+    ])
+    expect(leaked).toBe('idle')
+
+    const forged = await handler('$events/result', {
+      args: {
+        clientId: clientIdA,
+        eventId,
+        outcome: { kind: 'result', value: 'forged-member-b' },
+      },
+    }, new AbortController().signal, principalB)
+    expect(forged).toMatchObject({
+      ok: false,
+      error: { message: 'typert gateway: Remote event result does not belong to the opening stream' },
+    })
+    expect(settledResult).toBe(false)
+
+    await expect(handler('$events/result', {
+      args: {
+        clientId: clientIdA,
+        eventId,
+        outcome: { kind: 'result', value: 'accepted-member-a' },
+      },
+    }, new AbortController().signal, principalA)).resolves.toEqual({
+      ok: true,
+      value: undefined,
+    })
+    await expect(settled.promise).resolves.toEqual({
+      kind: 'result',
+      value: 'accepted-member-a',
+    })
+
+    carrierB.abort()
+    await expect(pendingB).resolves.toEqual({ done: true, value: undefined })
+    await eventsA.return(undefined)
+    await eventsB.return(undefined)
+    await unregister()
+    await ctx.fiber.dispose()
+  })
+
   it('preserves a lookup policy rejection through the Connection RPC result', async () => {
     const ctx = new Context()
     await ctx.plugin(TypertRegistry)
@@ -1306,7 +1459,11 @@ function rawConnection(ctx: Context): FakeConnectionService {
 }
 
 interface GatewayEventHarness {
-  openRemoteEvents(payload: unknown, signal: AbortSignal): AsyncGenerator
+  openRemoteEvents(
+    payload: unknown,
+    signal: AbortSignal,
+    principal?: RequestPrincipal,
+  ): AsyncGenerator
 }
 
 function rawGatewayEventHarness(ctx: Context): GatewayEventHarness {

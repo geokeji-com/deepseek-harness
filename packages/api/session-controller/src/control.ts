@@ -2,6 +2,7 @@
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, InboxState } from '@deepseek-ai/dsh-agent'
+import type { RequestPrincipal } from '@deepseek-ai/dsh-client-connection'
 import { Deque } from '@deepseek-ai/dsh-deque'
 import type { JobSnapshot } from '@deepseek-ai/dsh-jobs'
 import type {
@@ -16,10 +17,13 @@ import type {
   SessionProjectionValues,
   SessionQueuedItem,
 } from './types.ts'
+import { principalOwns, requestPrincipalOf } from './authorization.ts'
+
+type SessionControlUpdate = Exclude<SessionControlFrame, { readonly type: 'baseline' }>
 
 /** Owns the Host-wide Session control stream. */
 export class SessionControlController {
-  private readonly streams = new Set<ControlQueue>()
+  private readonly streams = new Set<ControlStream>()
 
   /** @param ctx - Host context carrying live Agent, projection, and jobs services. */
   constructor(private readonly ctx: Context) {
@@ -48,7 +52,7 @@ export class SessionControlController {
       if (jobs.length > 0) this.broadcast({ type: 'jobs', sessionId: session.id, jobs })
     })
     ctx.effect(() => () => {
-      for (const stream of this.streams) stream.end()
+      for (const stream of this.streams) stream.queue.end()
       this.streams.clear()
     }, 'session-controller.control')
   }
@@ -60,19 +64,22 @@ export class SessionControlController {
    */
   async *control(signal: AbortSignal): AsyncIterable<SessionControlFrame> {
     signal.throwIfAborted()
+    const principal = requestPrincipalOf(this.ctx)
     const queue = new ControlQueue()
-    this.streams.add(queue)
+    const stream: ControlStream = { principal, queue }
+    this.streams.add(stream)
     try {
-      yield { type: 'baseline', value: this.baseline() }
+      yield { type: 'baseline', value: this.baseline(principal) }
       yield* queue.iterate(signal)
     } finally {
-      this.streams.delete(queue)
+      this.streams.delete(stream)
       queue.end()
     }
   }
 
-  private baseline(): SessionControlBaseline {
+  private baseline(principal: RequestPrincipal | undefined): SessionControlBaseline {
     const sessions = this.ctx.sessions.list()
+      .filter(session => principalOwns(principal, session.header.ownerUserId))
     const queues = Object.create(null) as Record<SessionId, readonly SessionQueuedItem[]>
     const jobs = Object.create(null) as Record<SessionId, readonly SessionJob[]>
     for (const session of sessions) {
@@ -121,9 +128,18 @@ export class SessionControlController {
     return jobs === undefined ? [] : jobs.list(agent).map(jobView)
   }
 
-  private broadcast(frame: SessionControlFrame): void {
-    for (const stream of this.streams) stream.push(frame)
+  private broadcast(frame: SessionControlUpdate): void {
+    const ownerUserId = this.ctx.sessions.get(frame.sessionId)?.header.ownerUserId
+    for (const stream of this.streams) {
+      if (!principalOwns(stream.principal, ownerUserId)) continue
+      stream.queue.push(frame)
+    }
   }
+}
+
+interface ControlStream {
+  readonly principal: RequestPrincipal | undefined
+  readonly queue: ControlQueue
 }
 
 class ControlQueue {

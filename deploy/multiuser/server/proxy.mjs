@@ -1,23 +1,25 @@
 import http from 'node:http'
 import { randomUUID } from 'node:crypto'
+import { REQUEST_PRINCIPAL_HEADER, stripInternalIdentityHeaders } from './principal.mjs'
 
 function clientIp(request) {
   const raw = request.headers['x-real-ip'] ?? request.socket.remoteAddress ?? 'unknown'
   return String(raw).split(',', 1)[0].trim().replace(/^::ffff:/u, '') || 'unknown'
 }
 
-function forwardedHeaders(request, cookie, publicHost, upgrade = false) {
+export function forwardedHeaders(request, cookie, publicHost, principal, upgrade = false) {
   const headers = { ...request.headers }
   delete headers.cookie
   delete headers.connection
   delete headers['proxy-connection']
+  stripInternalIdentityHeaders(headers)
   headers.cookie = cookie
   headers.host = publicHost
   if (upgrade) {
     headers.connection = 'Upgrade'
   }
   headers['x-forwarded-proto'] = 'https'
-  headers['x-dsh-external-user'] = 'managed'
+  if (principal !== undefined) headers[REQUEST_PRINCIPAL_HEADER] = principal
   return headers
 }
 
@@ -30,16 +32,20 @@ function copyResponseHeaders(headers) {
   return result
 }
 
-function backendRequest(state, request, body = true) {
+function backendPort(state) {
+  return state.port ?? state.user.port
+}
+
+function backendRequest(state, request, principal, body = true) {
   return new Promise((resolve, reject) => {
-    const headers = forwardedHeaders(request, state.cookie, state.publicHost)
+    const headers = forwardedHeaders(request, state.cookie, state.publicHost, principal)
     if (Buffer.isBuffer(body)) {
       headers['content-length'] = String(body.length)
       delete headers['transfer-encoding']
     }
     const upstream = http.request({
       host: '127.0.0.1',
-      port: state.user.port,
+      port: backendPort(state),
       method: request.method,
       path: request.url,
       headers,
@@ -56,7 +62,7 @@ function backendRequest(state, request, body = true) {
   })
 }
 
-export function createProxyHandler({ auth, backends, logger, pathPolicy, publicHost }) {
+export function createProxyHandler({ auth, backends, logger, pathPolicy, principal, publicHost }) {
   return async function proxyHandler(request, response) {
     const traceId = randomUUID()
     const ip = clientIp(request)
@@ -96,12 +102,13 @@ export function createProxyHandler({ auth, backends, logger, pathPolicy, publicH
       }
       const state = await backends.ensure(userId, traceId)
       state.publicHost = publicHost
-      let result = await backendRequest(state, request, inspected.body)
+      const principalHeader = principal?.issue(userId, request.method ?? 'GET', request.url ?? '/')
+      let result = await backendRequest(state, request, principalHeader, inspected.body)
       if (result.response.statusCode === 401
         && (request.method === 'GET' || request.method === 'HEAD')) {
         result.response.resume()
         await backends.refreshCookie(userId, traceId)
-        result = await backendRequest(state, request, inspected.body)
+        result = await backendRequest(state, request, principalHeader, inspected.body)
       }
       const headers = copyResponseHeaders(result.response.headers)
       response.writeHead(result.response.statusCode ?? 502, headers)
@@ -130,7 +137,7 @@ export function createProxyHandler({ auth, backends, logger, pathPolicy, publicH
   }
 }
 
-export function createUpgradeHandler({ auth, backends, logger, publicHost }) {
+export function createUpgradeHandler({ auth, backends, logger, principal, publicHost }) {
   return async function upgradeHandler(request, clientSocket, head) {
     const traceId = randomUUID()
     const ip = clientIp(request)
@@ -147,10 +154,11 @@ export function createUpgradeHandler({ auth, backends, logger, publicHost }) {
     try {
       const state = await backends.ensure(userId, traceId)
       state.publicHost = publicHost
-      const headers = forwardedHeaders(request, state.cookie, publicHost, true)
+      const principalHeader = principal?.issue(userId, request.method ?? 'GET', request.url ?? '/')
+      const headers = forwardedHeaders(request, state.cookie, publicHost, principalHeader, true)
       const upstream = http.request({
         host: '127.0.0.1',
-        port: state.user.port,
+        port: backendPort(state),
         method: request.method,
         path: request.url,
         headers,

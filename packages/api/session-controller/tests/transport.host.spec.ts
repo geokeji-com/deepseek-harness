@@ -1,4 +1,5 @@
 import { Context } from '@deepseek-ai/cordis'
+import { RequestPrincipalService, toUserId } from '@deepseek-ai/dsh-client-connection'
 import { createScope } from '@deepseek-ai/dsh-scope'
 import SessionStore, { SESSION_FORMAT_VERSION, SessionId, SessionLogOffset, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { Session, SessionEvent, SessionHeader, SurfaceIntent } from '@deepseek-ai/dsh-session'
@@ -82,6 +83,34 @@ async function setup(): Promise<{ ctx: Context; transport: SessionHistoryControl
 }
 
 describe('SessionHistoryController', () => {
+  it('hides another principal Session from page and follow', async () => {
+    const { ctx, transport } = await setup()
+    const session = ctx.sessions.create(SessionId('owned-history'), {
+      meta: { cwd: '/workspace', ownerUserId: 'member-a' },
+    })
+    session.append('turn/start', { turn: 1 })
+    const principals = new RequestPrincipalService(ctx, {
+      secret: 'history-owner-isolation-secret-0123456789',
+    })
+    const memberB = {
+      userId: toUserId('member-b'),
+      issuedAt: 1,
+      expiresAt: Number.MAX_SAFE_INTEGER,
+    }
+    const address = { kind: 'session' as const, sessionId: session.id }
+
+    await expect(principals.run(
+      memberB,
+      () => transport.page({ address, throughSeq: 0 }, signal()),
+    )).rejects.toMatchObject({ code: 'session/not-found' })
+
+    const iterator = principals.bindIterable(
+      memberB,
+      transport.follow({ address }, signal()),
+    )[Symbol.asyncIterator]()
+    await expect(iterator.next()).rejects.toMatchObject({ code: 'session/not-found' })
+  })
+
   it('opens at the current cursor and follows later events from an ordinary Session', async () => {
     const { ctx, transport } = await setup()
     const session = ctx.sessions.create(SessionId('ordinary'), { meta: { cwd: '/workspace' } })

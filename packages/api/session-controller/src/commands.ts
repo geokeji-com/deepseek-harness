@@ -3,7 +3,12 @@
 import { randomUUID } from 'node:crypto'
 import type { Context } from '@deepseek-ai/cordis'
 import { brandString } from '@deepseek-ai/dsh-brand'
-import type { Agent, ModelSelection as AgentModelSelection } from '@deepseek-ai/dsh-agent'
+import {
+  AgentPoolCapacityError,
+  AgentTurnOverloadedError,
+  type Agent,
+  type ModelSelection as AgentModelSelection,
+} from '@deepseek-ai/dsh-agent'
 import { AttachmentError } from '@deepseek-ai/dsh-attachment'
 import type {
   AttachmentAdmissionPart, FileAttachmentRef, ImageAttachmentRef,
@@ -32,6 +37,7 @@ import {
   hasApiSessionSubagentOwner,
   inspectApiSession,
 } from './agent.ts'
+import { principalOwns, requestPrincipalOf, sessionNotFound } from './authorization.ts'
 import type {
   SessionAttachmentRequest,
   SessionAttachmentValue,
@@ -223,6 +229,9 @@ export class SessionCommandController {
       )
     }
     using source = observed
+    if (!principalOwns(requestPrincipalOf(this.ctx), source.header.ownerUserId)) {
+      throw sessionNotFound(request.sessionId)
+    }
     const lastSeq = source.events.at(-1)?.seq ?? -1
     const anchoredBoundary = atSeq === undefined
       ? undefined
@@ -266,6 +275,9 @@ export class SessionCommandController {
           ...(source.header.cwd === undefined ? {} : { cwd: source.header.cwd }),
           parentSession: source.header.id,
           isSeeded: true,
+          ...(source.header.ownerUserId === undefined
+            ? {}
+            : { ownerUserId: source.header.ownerUserId }),
           ...(composition.agentPreset === undefined
             ? {}
             : { agentPreset: composition.agentPreset }),
@@ -299,7 +311,10 @@ export class SessionCommandController {
    * @param request - Session identity, prompt content, source metadata, and delivery mode.
    * @returns acknowledgement that the Agent accepted the prompt.
    */
-  async prompt(request: SessionPromptRequest): Promise<SessionPromptValue> {
+  async prompt(
+    request: SessionPromptRequest,
+    signal?: AbortSignal,
+  ): Promise<SessionPromptValue> {
     if (!hasPromptContent(request.content)) {
       throw new RemoteError(
         'gateway/bad-request',
@@ -360,10 +375,16 @@ export class SessionCommandController {
           )
         }
         using binding = this.ctx.fileUploads.bindPrompt(agent, admission.receiptIds, request.requestId)
-        if (request.mode === 'steer') agent.steer(message)
-        else agent.followup(message)
+        if (request.mode === 'steer') await agent.steer(message, signal)
+        else await agent.followup(message, signal)
         binding.commit()
       } catch (error) {
+        if (error instanceof AgentTurnOverloadedError) {
+          throw new RemoteError('gateway/overloaded', error.message, {
+            reason: error.reason,
+            retryAfterMs: error.retryAfterMs,
+          })
+        }
         if (remoteErrorOf(error) !== undefined) throw error
         if (error instanceof AttachmentError) {
           throw new RemoteError('session/attachment-invalid', error.message, { reason: error.code })
@@ -421,7 +442,11 @@ export class SessionCommandController {
    * @param request - Session, queue item, and requested mutation.
    * @returns acknowledgement that the queue mutation was applied.
    */
-  updateQueue(request: SessionUpdateQueueRequest): SessionUpdateQueueValue {
+  updateQueue(
+    request: SessionUpdateQueueRequest,
+    signal?: AbortSignal,
+  ): SessionUpdateQueueValue | Promise<SessionUpdateQueueValue> {
+    signal?.throwIfAborted()
     if (request.action.kind === 'edit') {
       if (request.action.content.some(block => block.type !== 'text')) {
         throw new RemoteError(
@@ -441,6 +466,9 @@ export class SessionCommandController {
     const agent = this.ctx.agents.get(request.sessionId)
     if (agent === undefined) {
       throw new RemoteError('session/queue-item-not-found', 'queued item is no longer pending', { itemId: request.itemId })
+    }
+    if (!principalOwns(requestPrincipalOf(this.ctx), agent.session.header.ownerUserId)) {
+      throw sessionNotFound(request.sessionId)
     }
     if (hasApiSessionSubagentOwner(this.ctx, agent.session, agent)) {
       const identity = this.ctx.sessionProjections
@@ -480,7 +508,17 @@ export class SessionCommandController {
       }
       case 'steer':
         agent.inbox.remove(request.itemId)
-        agent.steer(message)
+        try {
+          const steering = signal === undefined ? agent.steer(message) : agent.steer(message, signal)
+          if (steering !== undefined) {
+            return steering.then(
+              () => ({ accepted: true }),
+              (error: unknown) => { throw mapQueueSteerError(error) },
+            )
+          }
+        } catch (error: unknown) {
+          throw mapQueueSteerError(error)
+        }
         break
       /* v8 ignore next 2 -- closed-union exhaustiveness guard */
       default:
@@ -503,6 +541,9 @@ export class SessionCommandController {
         { sessionId: request.sessionId },
       )
     }
+    if (!principalOwns(requestPrincipalOf(this.ctx), agent.session.header.ownerUserId)) {
+      throw sessionNotFound(request.sessionId)
+    }
     if (hasApiSessionSubagentOwner(this.ctx, agent.session, agent)) {
       throw apiSessionSubagentOwnershipError(request.sessionId)
     }
@@ -518,6 +559,12 @@ export class SessionCommandController {
 
   private rejectCreation(sessionId: SessionId, error: unknown): never {
     if (remoteErrorOf(error) !== undefined) throw error
+    if (error instanceof AgentPoolCapacityError) {
+      throw new RemoteError('gateway/overloaded', error.message, {
+        reason: 'agent-pool',
+        retryAfterMs: error.retryAfterMs,
+      })
+    }
     if (error instanceof ApiSessionPresetConflict) {
       throw new RemoteError('agent-preset/conflict', error.message, {
         sessionId: error.sessionId,
@@ -541,6 +588,9 @@ export class SessionCommandController {
   private async readSessionState(sessionId: SessionId): Promise<SessionReadState> {
     const attached = this.ctx.sessions.get(sessionId)
     if (attached !== undefined) {
+      if (!principalOwns(requestPrincipalOf(this.ctx), attached.header.ownerUserId)) {
+        throw new ApiSessionNotFound(`session "${sessionId}" not found`)
+      }
       // oxlint-disable-next-line typescript/no-deprecated -- Existing Session history read; migration deferred.
       return { id: attached.id, header: attached.header, events: attached.snapshotEvents() }
     }
@@ -559,6 +609,14 @@ export class SessionCommandController {
     }
     return undefined
   }
+}
+
+function mapQueueSteerError(error: unknown): unknown {
+  if (!(error instanceof AgentTurnOverloadedError)) return error
+  return new RemoteError('gateway/overloaded', error.message, {
+    reason: error.reason,
+    retryAfterMs: error.retryAfterMs,
+  })
 }
 
 function resolvePromptFileReceipts(

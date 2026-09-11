@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
+import { RequestPrincipalService, toUserId } from '@deepseek-ai/dsh-client-connection'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import Storage from '@deepseek-ai/dsh-storage'
 import { DomainFacility } from '@deepseek-ai/dsh-storage-domain'
@@ -78,6 +79,77 @@ async function nextFrame(
 }
 
 describe('WorkspaceController commands', () => {
+  it('filters Workspace Session membership and rejects another owner mutations', async () => {
+    const { controller, ctx, root } = await harness()
+    const workspace = await controller.create({ path: stageDir(root, 'shared') })
+    const memberA = ctx.sessions.create(SessionId('workspace-owned-a'), {
+      meta: { cwd: workspace.workspace.path, ownerUserId: 'member-a' },
+    })
+    const memberB = ctx.sessions.create(SessionId('workspace-owned-b'), {
+      meta: { cwd: workspace.workspace.path, ownerUserId: 'member-b' },
+    })
+    const registry = ctx.workspaceRegistry.get(workspace.workspace.workspaceId)
+    if (registry === undefined) throw new Error('fixture Workspace disappeared')
+    await registry.attachSession(memberA.id)
+    await registry.attachSession(memberB.id)
+    const principals = new RequestPrincipalService(ctx, {
+      secret: 'workspace-owner-isolation-secret-0123456789',
+    })
+    const principalA = {
+      userId: toUserId('member-a'),
+      issuedAt: 1,
+      expiresAt: Number.MAX_SAFE_INTEGER,
+    }
+    const principalB = {
+      userId: toUserId('member-b'),
+      issuedAt: 1,
+      expiresAt: Number.MAX_SAFE_INTEGER,
+    }
+
+    await expect(principals.run(principalA, () => controller.rename({
+      workspaceId: workspace.workspace.workspaceId,
+      title: 'visible to a',
+    }))).resolves.toMatchObject({
+      workspace: {
+        sessionIds: [memberA.id],
+      },
+    })
+    await expect(principals.run(principalB, () => controller.rename({
+      workspaceId: workspace.workspace.workspaceId,
+      title: 'visible to b',
+    }))).resolves.toMatchObject({
+      workspace: {
+        sessionIds: [memberB.id],
+      },
+    })
+    await expect(principals.run(principalB, () => controller.insertSessionBefore({
+      workspaceId: workspace.workspace.workspaceId,
+      sessionId: memberA.id,
+    }))).rejects.toMatchObject({ code: 'session/not-found' })
+    await expect(principals.run(principalB, () => controller.archiveSession({
+      sessionId: memberA.id,
+    }))).rejects.toMatchObject({ code: 'session/not-found' })
+
+    const abort = new AbortController()
+    const iterator = principals.bindIterable(principalB, controller.follow(abort.signal))
+      [Symbol.asyncIterator]()
+    await expect(iterator.next()).resolves.toMatchObject({
+      done: false,
+      value: {
+        type: 'baseline',
+        value: {
+          items: [{
+            workspaceId: workspace.workspace.workspaceId,
+            sessionIds: [memberB.id],
+          }],
+          archivedSessionIds: [],
+        },
+      },
+    })
+    abort.abort()
+    await iterator.next()
+  })
+
   it('serializes concurrent path adoption and preserves an existing title', async () => {
     const { controller, root } = await harness()
     const path = stageDir(root, 'alpha')

@@ -19,7 +19,6 @@ import {
 } from '../../session-persistence/tests/contract.ts'
 import { runLiveWritePathContract } from '../../session-persistence/tests/live-write-contract.ts'
 import { LIVE_WRITE_BATCH_MAX_DELAY_MS, type JsonlSessionHandle } from '../src/storage.ts'
-import { JsonlGenerationSourceChangedError } from '../src/generation.ts'
 import SessionStore from '@deepseek-ai/dsh-session'
 
 const statRace = vi.hoisted(() => ({
@@ -189,28 +188,6 @@ function migrationOneTurnLog(): SessionEvent[] {
   const [turn, user, step, ...tail] = releasedV1OneTurnLog()
   return [turn!, { ...step!, time: 2 }, { ...user!, time: 3 }, ...tail]
     .map((event, seq) => ({ ...event, seq: SessionSeq(seq) }))
-}
-
-/** Expected V3 insertion for an append-only log beginning with turn/start and step/start. */
-function withMigratedEmptyHead(log: readonly SessionEvent[]): readonly unknown[] {
-  return [
-    ...log.slice(0, 2),
-    {
-      type: 'system/message', seq: 2, time: log[1]!.time, surfaceOp: 'append',
-      data: { turn: 1, step: 1, message: {
-        id: expect.stringMatching(/^v2-to-v3-system-[0-9a-f]{64}$/) as unknown,
-        role: 'system', content: [], source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt' },
-      } },
-    },
-    ...log.slice(2).map(event => ({ ...event, seq: SessionSeq(event.seq + 1) })),
-  ]
-}
-
-function migratedOneTurnLog(): readonly unknown[] {
-  const [turn, user, step, ...tail] = oneTurnLog()
-  const log = [turn!, { ...step!, time: 2 }, { ...user!, time: 3 }, ...tail]
-    .map((event, seq) => ({ ...event, seq: SessionSeq(seq) }))
-  return withMigratedEmptyHead(log)
 }
 
 function releasedV1PackedPhysicalLog(header: SessionHeader): string {
@@ -697,8 +674,8 @@ describe('JsonlSessionPersistence: immutable format generations', () => {
 
   afterEach(async () => { await ctx.fiber.dispose() })
 
-  it('projects a released v0 header through stat and list without reading or mutating its body', async () => {
-    expect(SESSION_FORMAT_VERSION).toBe(3)
+  it('refuses an ownerless released v0 header in stat and skips it in list without mutating its body', async () => {
+    expect(SESSION_FORMAT_VERSION).toBe(4)
     const header = meta('released-v0-metadata', '/work')
     const sourcePath = historicalLogPath(root, header.cwd, header.id)
     const currentPath = rawLogPath(root, header.cwd, header.id)
@@ -708,16 +685,16 @@ describe('JsonlSessionPersistence: immutable format generations', () => {
     await mkdir(dirname(sourcePath), { recursive: true })
     await writeFile(sourcePath, source)
 
-    expect(await ctx.sessionPersistence.stat(header.id)).toMatchObject({
-      header: { id: header.id, version: SESSION_FORMAT_VERSION },
+    await expect(ctx.sessionPersistence.stat(header.id)).rejects.toMatchObject({
+      name: 'SessionFormatUnsupportedError',
+      message: expect.stringContaining('owner-aware migration tool') as unknown,
     })
-    const [listed] = await ctx.sessionPersistence.list()
-    expect(listed?.header).toMatchObject({ id: header.id, version: SESSION_FORMAT_VERSION })
+    await expect(ctx.sessionPersistence.list()).resolves.toEqual([])
     expect(await readFile(sourcePath)).toEqual(source)
     await expect(stat(currentPath)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
-  it('serves a migrated v0 read without publishing at the service durability barrier', async () => {
+  it('refuses an ownerless v0 read without publishing at the service durability barrier', async () => {
     const header = meta('released-v0-read', '/work')
     const sourcePath = historicalLogPath(root, header.cwd, header.id)
     const currentPath = rawLogPath(root, header.cwd, header.id)
@@ -727,14 +704,10 @@ describe('JsonlSessionPersistence: immutable format generations', () => {
     await mkdir(dirname(sourcePath), { recursive: true })
     await writeFile(sourcePath, source)
 
-    const restored = await readAll(ctx.sessionPersistence, header.id)
-    expect(restored).toEqual({
-      meta: { ...header, delegationDepth: 0 },
-      events: migratedOneTurnLog(),
+    await expect(readAll(ctx.sessionPersistence, header.id)).rejects.toMatchObject({
+      name: 'SessionFormatUnsupportedError',
+      message: expect.stringContaining('owner-aware migration tool') as unknown,
     })
-    const userMessage = restored.events.find(event => event.type === 'user/message')
-    expect(userMessage).toBeDefined()
-    expect(Object.isFrozen(userMessage?.data)).toBe(true)
     expect(await readFile(sourcePath)).toEqual(source)
     await expect(readFile(currentPath)).rejects.toMatchObject({ code: 'ENOENT' })
     expect((await readdir(dirname(sourcePath))).filter(name => name.startsWith('session')).sort())
@@ -766,30 +739,36 @@ describe('JsonlSessionPersistence: immutable format generations', () => {
     })
   })
 
-  it('singleflights concurrent historical reads and keeps service flush read-only', async () => {
+  it('singleflights concurrent historical refusals and keeps service flush read-only', async () => {
     const header = meta('released-v0-source-drift', '/work')
     const sourcePath = historicalLogPath(root, header.cwd, header.id)
     await mkdir(dirname(sourcePath), { recursive: true })
     await writeFile(sourcePath, `${JSON.stringify(releasedV0Header(header))}\n`)
     readTally.enabled = true
 
-    const [first, second] = await Promise.all([
+    const [first, second] = await Promise.allSettled([
       ctx.sessionPersistence.open(header.id, 'read'),
       ctx.sessionPersistence.open(header.id, 'read'),
     ])
-    expect((await first.read()).events).toEqual([])
-    expect((await second.read()).events).toEqual([])
+    for (const result of [first, second]) {
+      expect(result.status).toBe('rejected')
+      if (result.status === 'rejected') {
+        expect(result.reason).toMatchObject({
+          name: 'SessionFormatUnsupportedError',
+          message: expect.stringContaining('owner-aware migration tool') as unknown,
+        })
+      }
+    }
     expect(readTally.bySuffix.get(sourcePath)).toBe(1)
     await appendFile(sourcePath, '\n')
 
     await expect(ctx.sessionPersistence.flush()).resolves.toBeUndefined()
     await expect(stat(rawLogPath(root, header.cwd, header.id))).rejects.toMatchObject({ code: 'ENOENT' })
-    await Promise.all([first.close(), second.close()])
     await ctx.fiber.dispose()
     ctx = new Context()
   })
 
-  it('does not join an in-flight historical preparation for an older source revision', async () => {
+  it('refuses historical reads without joining nonexistent owner assignment work', async () => {
     const header = meta('released-v0-revision-singleflight', '/work')
     const sourcePath = historicalLogPath(root, header.cwd, header.id)
     await mkdir(dirname(sourcePath), { recursive: true })
@@ -810,14 +789,12 @@ describe('JsonlSessionPersistence: immutable format generations', () => {
       pause.release()
     }
 
-    const [first, second] = await Promise.all([firstOpening, secondOpening])
-    try {
-      if (tallyFailure !== undefined) throw tallyFailure
-      expect((await first.read()).events).toEqual(migratedOneTurnLog())
-      expect((await second.read()).events).toEqual(migratedOneTurnLog())
-    } finally {
-      await Promise.all([first.close(), second.close()])
-    }
+    const [first, second] = await Promise.allSettled([firstOpening, secondOpening])
+    if (tallyFailure !== undefined) throw tallyFailure
+    expect(first.status).toBe('rejected')
+    expect(second.status).toBe('rejected')
+    expect(readTally.bySuffix.get(sourcePath)).toBeGreaterThanOrEqual(2)
+    await expect(stat(rawLogPath(root, header.cwd, header.id))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('lets one historical-open caller abort without cancelling another waiter', async () => {
@@ -843,8 +820,10 @@ describe('JsonlSessionPersistence: immutable format generations', () => {
       controller.abort(reason)
       await expect(first).rejects.toBe(reason)
       pause.release()
-      const handle = await second
-      expect((await handle.read()).events).toEqual([])
+      await expect(second).rejects.toMatchObject({
+        name: 'SessionFormatUnsupportedError',
+        message: expect.stringContaining('owner-aware migration tool') as unknown,
+      })
       expect(readTally.bySuffix.get(sourcePath)).toBe(1)
     } finally {
       controller.abort(reason)
@@ -876,13 +855,14 @@ describe('JsonlSessionPersistence: immutable format generations', () => {
     await pause.finished
     await scheduler.yield()
 
-    const retried = await ctx.sessionPersistence.open(header.id, 'read')
-    expect((await retried.read()).events).toEqual([])
+    await expect(ctx.sessionPersistence.open(header.id, 'read')).rejects.toMatchObject({
+      name: 'SessionFormatUnsupportedError',
+      message: expect.stringContaining('owner-aware migration tool') as unknown,
+    })
     expect(readTally.bySuffix.get(sourcePath)).toBe(2)
-    await retried.close()
   })
 
-  it.each(['read', 'write'] as const)('refuses the frozen pre-step V0 fixture on %s open without publishing a successor', async (access) => {
+  it.each(['read', 'write'] as const)('refuses the ownerless frozen V0 fixture on %s open without publishing a successor', async (access) => {
     const id = SessionId('released-v0-real-shapes')
     const sourcePath = historicalLogPath(root, '/work', id)
     const currentPath = rawLogPath(root, '/work', id)
@@ -895,7 +875,7 @@ describe('JsonlSessionPersistence: immutable format generations', () => {
 
     await expect(ctx.sessionPersistence.open(id, access)).rejects.toMatchObject({
       name: 'SessionFormatUnsupportedError',
-      message: expect.stringContaining('surface before first step') as unknown,
+      message: expect.stringContaining('owner-aware migration tool') as unknown,
     })
     await ctx.sessionPersistence.flush()
 
@@ -908,7 +888,7 @@ describe('JsonlSessionPersistence: immutable format generations', () => {
       .toEqual(['session.jsonl'])
   })
 
-  it.each(['read', 'write'] as const)('restores canonical replacement envelopes from valid V2 chronology on %s open', async (access) => {
+  it.each(['read', 'write'] as const)('refuses canonical replacement envelopes from ownerless V2 chronology on %s open', async (access) => {
     const header = meta('released-v2-replacement', '/work')
     const sourcePath = generationLogPath(root, header.cwd, header.id, 2, 'none')
     const currentPath = rawLogPath(root, header.cwd, header.id)
@@ -927,30 +907,16 @@ describe('JsonlSessionPersistence: immutable format generations', () => {
     ].join('\n'))
     await mkdir(dirname(sourcePath), { recursive: true })
     await writeFile(sourcePath, source)
-    const handle = await ctx.sessionPersistence.open(header.id, access)
-    try {
-      const restored = await handle.read()
-      expect(restored.events[2]).toMatchObject({ type: 'system/message', surfaceOp: 'append' })
-      expect(restored.events[4]).toMatchObject({
-        type: 'user/message', seq: 4,
-        surfaceOp: { op: 'replace', startSeq: 3, endSeq: 3 }, sourceEventSeqs: [3],
-      })
-      expect(restored.events[4]?.surfaceOp).not.toHaveProperty('start')
-      expect(restored.events[4]?.surfaceOp).not.toHaveProperty('end')
-      await ctx.sessionPersistence.flush()
-      if (access === 'write') {
-        const published = scanLog(await readFile(currentPath))
-        expect(published.events).toEqual(restored.events)
-      } else {
-        await expect(readFile(currentPath)).rejects.toMatchObject({ code: 'ENOENT' })
-      }
-      expect(await readFile(sourcePath)).toEqual(source)
-    } finally {
-      await handle.close()
-    }
+    await expect(ctx.sessionPersistence.open(header.id, access)).rejects.toMatchObject({
+      name: 'SessionFormatUnsupportedError',
+      message: expect.stringContaining('owner-aware migration tool') as unknown,
+    })
+    await ctx.sessionPersistence.flush()
+    expect(await readFile(sourcePath)).toEqual(source)
+    await expect(readFile(currentPath)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
-  it('reads v1 packed chunk rows without publishing or changing the source', async () => {
+  it('refuses ownerless v1 packed chunk rows without publishing or changing the source', async () => {
     const header = meta('released-v1-read', '/work')
     const sourcePath = generationLogPath(root, header.cwd, header.id, 1, 'none')
     const currentPath = rawLogPath(root, header.cwd, header.id)
@@ -958,13 +924,10 @@ describe('JsonlSessionPersistence: immutable format generations', () => {
     await mkdir(dirname(sourcePath), { recursive: true })
     await writeFile(sourcePath, source)
 
-    const restored = await readAll(ctx.sessionPersistence, header.id)
-    expect(restored.meta).toEqual({ ...header, delegationDepth: 0 })
-    expect(restored.events.map(event => event.type)).toEqual([
-      'turn/start', 'step/start', 'system/message', 'user/message', 'assistant/message', 'step/end', 'turn/end',
-    ])
-    expect(restored.events.find(event => event.type === 'assistant/message'))
-      .toMatchObject({ data: { message: { content: [{ type: 'text', text: 'hello' }] } } })
+    await expect(readAll(ctx.sessionPersistence, header.id)).rejects.toMatchObject({
+      name: 'SessionFormatUnsupportedError',
+      message: expect.stringContaining('owner-aware migration tool') as unknown,
+    })
 
     expect(await readFile(sourcePath)).toEqual(source)
     await expect(readFile(currentPath)).rejects.toMatchObject({ code: 'ENOENT' })
@@ -972,7 +935,7 @@ describe('JsonlSessionPersistence: immutable format generations', () => {
       .toEqual(['session.v1.jsonl'])
   })
 
-  it('selects v1 from a v0/v1 directory, then v3 from the retained three-generation set', async () => {
+  it('selects the highest historical generation for owner-aware refusal', async () => {
     const header = meta('mixed-generation-read', '/work')
     const directory = sessionDir(root, header.cwd, header.id)
     const v0Path = historicalLogPath(root, header.cwd, header.id)
@@ -982,19 +945,15 @@ describe('JsonlSessionPersistence: immutable format generations', () => {
     await writeFile(v0Path, `${JSON.stringify(releasedV0Header(header))}\n`)
     await writeFile(v1Path, releasedV1PackedPhysicalLog(header))
 
-    const migrated = await readAll(ctx.sessionPersistence, header.id)
-    expect(migrated.events.map(event => event.type)).toContain('assistant/message')
-    const writer = await ctx.sessionPersistence.open(header.id, 'write')
-    await writer.close()
-    expect((await readdir(directory)).filter(name => name.startsWith('session')).sort())
-      .toEqual(process.platform === 'win32'
-        ? ['session.jsonl', 'session.v1.jsonl', 'session.v3.jsonl']
-        : ['session.jsonl', 'session.lock', 'session.v1.jsonl', 'session.v3.jsonl'])
-
+    const refusal = () => expect(readAll(ctx.sessionPersistence, header.id)).rejects.toMatchObject({
+      name: 'SessionFormatUnsupportedError',
+      message: expect.stringContaining('owner-aware migration tool') as unknown,
+    })
+    await refusal()
     await writeFile(v0Path, 'corrupt lower v0\n')
-    await writeFile(v1Path, 'corrupt lower v1\n')
-    await expect(readAll(ctx.sessionPersistence, header.id)).resolves.toEqual(migrated)
-    expect(await readFile(v3Path, 'utf8')).toContain('"version":3')
+    await refusal()
+    await expect(readFile(v1Path)).resolves.toBeInstanceOf(Buffer)
+    await expect(readFile(v3Path)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('does not publish a historical generation through handle storage resolution', async () => {
@@ -1010,7 +969,7 @@ describe('JsonlSessionPersistence: immutable format generations', () => {
     await expect(readFile(currentPath)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
-  it('opens the migrated successor for append while retaining the historical source', async () => {
+  it('refuses an ownerless historical append without creating a successor', async () => {
     const header = meta('released-v0-write', '/work')
     const sourcePath = historicalLogPath(root, header.cwd, header.id)
     const source = Buffer.from(
@@ -1023,16 +982,15 @@ describe('JsonlSessionPersistence: immutable format generations', () => {
       { type: 'turn/end', seq: SessionSeq(8), time: 10, data: { turn: 2, reason: { kind: 'completed' } } },
     ]
 
-    await appendBatch(ctx.sessionPersistence, header.id, suffix)
-
+    await expect(appendBatch(ctx.sessionPersistence, header.id, suffix)).rejects.toMatchObject({
+      name: 'SessionFormatUnsupportedError',
+      message: expect.stringContaining('owner-aware migration tool') as unknown,
+    })
     expect(await readFile(sourcePath)).toEqual(source)
-    expect((await readAll(ctx.sessionPersistence, header.id)).events).toEqual([
-      ...migratedOneTurnLog(),
-      ...suffix,
-    ])
+    await expect(stat(rawLogPath(root, header.cwd, header.id))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
-  it('switches an existing prepared read handle to the published append tail', async () => {
+  it('rejects an ownerless historical read before a handle can be opened', async () => {
     const header = meta('released-v0-read-handoff', '/work')
     const sourcePath = historicalLogPath(root, header.cwd, header.id)
     await mkdir(dirname(sourcePath), { recursive: true })
@@ -1040,58 +998,47 @@ describe('JsonlSessionPersistence: immutable format generations', () => {
       sourcePath,
       `${JSON.stringify(releasedV0Header(header))}\n${migrationOneTurnLog().map(event => JSON.stringify(event)).join('\n')}\n`,
     )
-    const reader = await ctx.sessionPersistence.open(header.id, 'read')
-    const suffix: SessionEvent[] = [
-      { type: 'turn/start', seq: SessionSeq(7), time: 9, data: { turn: 2 } },
-      { type: 'turn/end', seq: SessionSeq(8), time: 10, data: { turn: 2, reason: { kind: 'completed' } } },
-    ]
-    try {
-      expect((await reader.read()).events).toEqual(migratedOneTurnLog())
-      await appendBatch(ctx.sessionPersistence, header.id, suffix)
-      expect((await reader.read()).events).toEqual([...migratedOneTurnLog(), ...suffix])
-    } finally {
-      await reader.close()
-    }
+    await expect(ctx.sessionPersistence.open(header.id, 'read')).rejects.toMatchObject({
+      name: 'SessionFormatUnsupportedError',
+      message: expect.stringContaining('owner-aware migration tool') as unknown,
+    })
   })
 
-  it('fails a stale prepared publication once and re-prepares on the next write open', async () => {
+  it('checks the owner boundary before a stale historical publication could start', async () => {
     const header = meta('released-v0-write-source-drift', '/work')
     const sourcePath = historicalLogPath(root, header.cwd, header.id)
     const currentPath = rawLogPath(root, header.cwd, header.id)
     const source = `${JSON.stringify(releasedV0Header(header))}\n`
     await mkdir(dirname(sourcePath), { recursive: true })
     await writeFile(sourcePath, source)
-    await readAll(ctx.sessionPersistence, header.id)
-    vi.spyOn(scheduler, 'yield').mockImplementationOnce(async () => {
-      await appendFile(sourcePath, '\n')
-    })
-
     await expect(ctx.sessionPersistence.open(header.id, 'write'))
-      .rejects.toBeInstanceOf(JsonlGenerationSourceChangedError)
+      .rejects.toMatchObject({
+        name: 'SessionFormatUnsupportedError',
+        message: expect.stringContaining('owner-aware migration tool') as unknown,
+      })
     await expect(readFile(currentPath)).rejects.toMatchObject({ code: 'ENOENT' })
 
-    const writer = await ctx.sessionPersistence.open(header.id, 'write')
-    await writer.close()
-    expect(await readFile(sourcePath, 'utf8')).toBe(`${source}\n`)
-    expect(await readFile(currentPath, 'utf8')).toContain('"version":3')
+    const writer = ctx.sessionPersistence.open(header.id, 'write')
+    await expect(writer).rejects.toMatchObject({
+      name: 'SessionFormatUnsupportedError',
+      message: expect.stringContaining('owner-aware migration tool') as unknown,
+    })
+    expect(await readFile(sourcePath, 'utf8')).toBe(source)
   })
 
-  it('finishes publication before rejecting a write open cancelled during publication', async () => {
+  it('never starts an ownerless historical publication that could be cancelled', async () => {
     const header = meta('released-v0-publication-cancellation', '/work')
     const sourcePath = historicalLogPath(root, header.cwd, header.id)
     const currentPath = rawLogPath(root, header.cwd, header.id)
     await mkdir(dirname(sourcePath), { recursive: true })
     await writeFile(sourcePath, `${JSON.stringify(releasedV0Header(header))}\n`)
-    await readAll(ctx.sessionPersistence, header.id)
     const controller = new AbortController()
     const reason = new Error('write open cancelled during publication')
-    vi.spyOn(scheduler, 'yield').mockImplementationOnce(async () => { controller.abort(reason) })
+    controller.abort(reason)
 
     await expect(ctx.sessionPersistence.open(header.id, 'write', { signal: controller.signal }))
       .rejects.toBe(reason)
-    expect(await readFile(currentPath, 'utf8')).toContain('"version":3')
-    const writer = await ctx.sessionPersistence.open(header.id, 'write')
-    await writer.close()
+    await expect(readFile(currentPath)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('treats a historical generation as an existing id at create', async () => {
@@ -1220,7 +1167,7 @@ describe('JsonlSessionPersistence: immutable format generations', () => {
     })
   })
 
-  it('leaves v0 unchanged when migration policy refuses an unknown event', async () => {
+  it('leaves v0 unchanged when the owner boundary refuses migration', async () => {
     const header = meta('released-v0-refusal', '/work')
     const sourcePath = historicalLogPath(root, header.cwd, header.id)
     const source = Buffer.from([
@@ -1235,7 +1182,7 @@ describe('JsonlSessionPersistence: immutable format generations', () => {
       .then(() => undefined, (error: unknown) => error)
     expect(failure).toBeInstanceOf(Error)
     expect((failure as Error).name).toBe('SessionFormatUnsupportedError')
-    expect((failure as Error).message).toContain('unknown historical event type "external/info" at seq 0')
+    expect((failure as Error).message).toContain('owner-aware migration tool')
     expect(await readFile(sourcePath)).toEqual(source)
     await expect(stat(rawLogPath(root, header.cwd, header.id))).rejects.toMatchObject({ code: 'ENOENT' })
   })
@@ -2287,7 +2234,7 @@ describe('JsonlSessionPersistence: nested v3 Assistant streams', () => {
     expect(loaded.events).toEqual(log)
   })
 
-  it.each([2, 3])('reads v%s rows and appends a v3 turn without changing predecessor bytes', async (version) => {
+  it.each([2, 3])('refuses ownerless v%s rows before a current successor can be created', async (version) => {
     const m = meta('mixed', '/work')
     const log = chunkRunLog()
     const sourcePath = generationLogPath(root, '/work', m.id, version, 'none')
@@ -2302,32 +2249,12 @@ describe('JsonlSessionPersistence: nested v3 Assistant streams', () => {
     await mkdir(dirname(sourcePath), { recursive: true })
     await writeFile(sourcePath, source)
 
-    const expected = version === 2 ? withMigratedEmptyHead(log) : log
-    const restored = await readAll(ctx.sessionPersistence, m.id)
-    expect(restored.meta.version).toBe(3)
-    expect(restored.events).toEqual(expected)
+    await expect(readAll(ctx.sessionPersistence, m.id)).rejects.toMatchObject({
+      name: 'SessionFormatUnsupportedError',
+      message: expect.stringContaining('owner-aware migration tool') as unknown,
+    })
     expect(await readFile(sourcePath)).toEqual(source)
-    if (version === 2) await expect(readFile(currentPath)).rejects.toMatchObject({ code: 'ENOENT' })
-    const secondTurn: SessionEvent[] = JSON.parse(JSON.stringify(log)) as SessionEvent[]
-    for (const [k, e] of secondTurn.entries()) {
-      ;(e as { seq: number }).seq = expected.length + k
-      ;(e.data as { turn: number }).turn = 2
-    }
-    await appendBatch(ctx.sessionPersistence, m.id, secondTurn)
-
-    const loaded = await readAll(ctx.sessionPersistence, m.id)
-    expect(loaded.events).toEqual([...expected, ...secondTurn])
-    expect(currentPath).toBe(join(dirname(sourcePath), 'session.v3.jsonl'))
-    const successor = (await readFile(currentPath, 'utf8')).trimEnd().split('\n')
-    expect(JSON.parse(successor[0] as string)).toMatchObject({ version: 3 })
-    expect(successor.slice(1).map(row => JSON.parse(row) as unknown)).toEqual([...expected, ...secondTurn])
-    if (version === 2) expect(await readFile(sourcePath)).toEqual(source)
-    // Compact tags stay nested; physical rows contain only current event tags.
-    const tags = (await readFile(rawLogPath(root, '/work', m.id), 'utf8')).split('\n').filter(Boolean)
-      .map(line => (JSON.parse(line) as { type: string }).type)
-    expect(tags.filter(t => t === 'text-chunks')).toHaveLength(0)
-    expect(tags.filter(t => t === 'assistant/chunk')).toHaveLength(0)
-    expect(tags.filter(t => t === 'assistant/message')).toHaveLength(2)
+    await expect(readFile(currentPath)).rejects.toMatchObject({ code: 'ENOENT' })
   })
 
   it('scanLog rejects a removed top-level packed row before a committed boundary', () => {

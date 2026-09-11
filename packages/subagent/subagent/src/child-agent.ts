@@ -145,6 +145,7 @@ export function childSessionMeta(
   return {
     ...parentHeader.cwd !== undefined ? { cwd: parentHeader.cwd } : {},
     ...agentPreset === undefined ? {} : { agentPreset },
+    ...parentHeader.ownerUserId === undefined ? {} : { ownerUserId: parentHeader.ownerUserId },
     parentSession: parentHeader.id,
     isSeeded,
     // Navigation classification only; the descriptor remains the authority

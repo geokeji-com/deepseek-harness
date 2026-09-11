@@ -1,6 +1,7 @@
 /** Cold-safe Session list and search projection. */
 
 import type { Context } from '@deepseek-ai/cordis'
+import type { RequestPrincipal } from '@deepseek-ai/dsh-client-connection'
 import type {} from '@deepseek-ai/dsh-agent-presets'
 import type { ImageAttachmentLimits } from '@deepseek-ai/dsh-attachment'
 import { SessionLogOffset } from '@deepseek-ai/dsh-session'
@@ -10,6 +11,7 @@ import type {} from '@deepseek-ai/dsh-session-projection-cache'
 import { SessionQueryError, type SessionSearchCursor } from '@deepseek-ai/dsh-session-query'
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
 import { z } from 'zod'
+import { principalOwns } from './authorization.ts'
 import {
   SESSION_SEARCH_RESULT_LIMIT,
   SESSION_SEARCH_SNIPPET_MAX_CODE_POINTS,
@@ -123,13 +125,17 @@ export class ApiSessionList {
    * @param signal - optional cancellation for persistence reads.
    * @returns visible Session summaries ordered by activity.
    */
-  async list(signal?: AbortSignal): Promise<SessionSummary[]> {
+  async list(
+    signal?: AbortSignal,
+    principal?: RequestPrincipal,
+  ): Promise<SessionSummary[]> {
     signal?.throwIfAborted()
     const records = await this.ctx.sessionQuery.listSessions(signal)
     signal?.throwIfAborted()
     const items: SessionSummary[] = []
     const cold: SessionHeader[] = []
     for (const record of records) {
+      if (!principalOwns(principal, record.header.ownerUserId)) continue
       const live = this.ctx.sessions.get(record.header.id)
       if (live !== undefined) {
         items.push(this.summaryFor(live))
@@ -163,7 +169,11 @@ export class ApiSessionList {
    * @param signal - cancellation for list and search reads.
    * @returns authorized bounded Session search results.
    */
-  async search(query: string, signal: AbortSignal): Promise<SessionSearchValue> {
+  async search(
+    query: string,
+    signal: AbortSignal,
+    principal?: RequestPrincipal,
+  ): Promise<SessionSearchValue> {
     const normalizedQuery = normalizeSearchQuery(query)
     signal.throwIfAborted()
     const provider = this.ctx.get('sessionQuery')
@@ -179,6 +189,7 @@ export class ApiSessionList {
       signal.throwIfAborted()
       const visibleIds = new Set(visible
         .filter(record => record.header.cwd !== undefined)
+        .filter(record => principalOwns(principal, record.header.ownerUserId))
         .map(record => record.header.id))
       if (visibleIds.size === 0) return { items: [], hasMore: false }
       const authorized: SessionSearchItem[] = []

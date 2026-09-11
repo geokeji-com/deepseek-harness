@@ -83,6 +83,7 @@ interface HeaderLine {
   type: 'session'
   version: number
   id: SessionId
+  ownerUserId?: string
   createdAt: number
   cwd?: string
   parentSession?: SessionId
@@ -93,7 +94,7 @@ interface HeaderLine {
 }
 
 const HEADER_REQUIRED_KEYS = ['type', 'version', 'id', 'createdAt', 'isSeeded', 'delegationDepth'] as const
-const HEADER_OPTIONAL_KEYS = ['cwd', 'parentSession', 'origin', 'agentPreset'] as const
+const HEADER_OPTIONAL_KEYS = ['ownerUserId', 'cwd', 'parentSession', 'origin', 'agentPreset'] as const
 const HEADER_KEYS = new Set<string>([...HEADER_REQUIRED_KEYS, ...HEADER_OPTIONAL_KEYS])
 
 /**
@@ -142,6 +143,7 @@ function fromHeaderLine(line: HeaderLine): SessionStorageMetadata {
     meta: {
       version: SESSION_FORMAT_VERSION,
       id: line.id,
+      ...line.ownerUserId !== undefined ? { ownerUserId: line.ownerUserId } : {},
       createdAt: line.createdAt,
       ...line.cwd !== undefined ? { cwd: line.cwd } : {},
       ...line.parentSession !== undefined ? { parentSession: line.parentSession } : {},
@@ -163,6 +165,9 @@ function isHeaderLine(value: unknown): value is HeaderLine {
     && (value as { type?: unknown }).type === 'session'
     && typeof (value as { version?: unknown }).version === 'number'
     && typeof (value as { id?: unknown }).id === 'string'
+    && ((value as { ownerUserId?: unknown }).ownerUserId === undefined
+      || (typeof (value as { ownerUserId?: unknown }).ownerUserId === 'string'
+        && (value as { ownerUserId: string }).ownerUserId.length > 0))
     && typeof (value as { createdAt?: unknown }).createdAt === 'number'
     && Number.isSafeInteger((value as { createdAt: number }).createdAt)
     && (value as { createdAt: number }).createdAt >= 0
@@ -488,7 +493,7 @@ export class SessionLogScanner {
     // This scanner accepts only current-generation files. Owned structural refusal must
     // precede its recoverable-tail suppression, independently of the strict decoder state.
     try {
-      assertV3RowAdmission(decoded)
+      assertV3RowAdmission(decoded, 4)
     } catch (error: unknown) {
       if (error instanceof SessionFormatUnsupportedMigrationError) throw new SessionFormatUnsupportedError(error.message)
       throw error

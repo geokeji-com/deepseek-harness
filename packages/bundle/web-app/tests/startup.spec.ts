@@ -10,6 +10,7 @@ import { pathToFileURL } from 'node:url'
 import { Context } from '@deepseek-ai/cordis'
 import Loader from '@deepseek-ai/cordis-plugin-loader'
 import Include from '@deepseek-ai/cordis-plugin-include'
+import { loadOverlayPatches } from '@deepseek-ai/dsh-app-boot'
 import { internals, provideCmdline } from '@deepseek-ai/dsh-cmdline'
 import { afterEach, describe, expect, it } from 'vitest'
 import { apply, WEB_STARTUP_SERVICE, type WebStartupValues } from '../src/startup.ts'
@@ -92,6 +93,22 @@ export const apply = ctx => globalThis.__webStartupApply(ctx)
 }
 
 describe('web command-line provider', () => {
+  it('injects webStartup into the connection row that reads its principal secret', () => {
+    const patches = loadOverlayPatches(
+      'dsh',
+      join(import.meta.dirname, '..', 'cordis.patch.yml'),
+    )
+    const connection = patches
+      .flatMap(entry => entry.insert ?? [])
+      .find(entry => entry.id === 'connection')
+    expect(connection?.inject).toEqual(['webRuntime', 'webStartup'])
+    expect(connection?.config).toMatchObject({
+      principal: {
+        secret: { __jsExpr: "ctx.webStartup.requestPrincipalSecret ?? ''" },
+      },
+    })
+  })
+
   it('publishes each flag and releases direct service expressions', async () => {
     const { values, observed } = await bootProvider([
       '--host', '127.0.0.1',

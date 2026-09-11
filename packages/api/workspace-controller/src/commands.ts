@@ -1,6 +1,12 @@
 /** Workspace command implementation and stable Remote failure mapping. */
 
 import type { Context } from '@deepseek-ai/cordis'
+import {
+  currentRequestPrincipal,
+  requestPrincipalOwns,
+  type RequestPrincipal,
+} from '@deepseek-ai/dsh-client-connection'
+import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { Workspace } from '@deepseek-ai/dsh-workspace'
 import {
   WorkspaceId,
@@ -37,14 +43,15 @@ export class WorkspaceCommands {
    * @returns the Workspace and whether this call created it.
    */
   create(request: WorkspaceCreateRequest): Promise<WorkspaceCreateValue> {
+    const principal = currentRequestPrincipal(this.ctx)
     return this.enqueue(async () => {
       try {
         const existing = await this.ctx.workspaceRegistry.resolveByPath(request.path)
         if (existing !== undefined) {
-          return { workspace: workspaceView(existing), created: false }
+          return { workspace: workspaceView(existing, this.visible(principal)), created: false }
         }
         const workspace = await this.ctx.workspaceRegistry.create(request.path)
-        return { workspace: workspaceView(workspace), created: true }
+        return { workspace: workspaceView(workspace, this.visible(principal)), created: true }
       } catch (error) {
         if (remoteErrorOf(error) !== undefined) throw error
         throw new RemoteError(
@@ -67,6 +74,7 @@ export class WorkspaceCommands {
     if (title === '') {
       return Promise.reject(new RemoteError('gateway/bad-request', 'Workspace rename requires a non-blank title', {}))
     }
+    const principal = currentRequestPrincipal(this.ctx)
     return this.enqueue(async () => {
       const workspace = this.requireWorkspace(request.workspaceId)
       if (title !== workspace.title) {
@@ -80,7 +88,7 @@ export class WorkspaceCommands {
         }
         await workspace.setTitle(title)
       }
-      return { workspace: workspaceView(workspace) }
+      return { workspace: workspaceView(workspace, this.visible(principal)) }
     })
   }
 
@@ -124,7 +132,12 @@ export class WorkspaceCommands {
    * @returns the updated Workspace projection.
    */
   async insertSessionBefore(request: WorkspaceInsertSessionBeforeRequest): Promise<WorkspaceValue> {
+    const principal = currentRequestPrincipal(this.ctx)
     const workspace = this.requireWorkspace(request.workspaceId)
+    this.requireOwnedSession(request.sessionId, principal)
+    if (request.beforeSessionId !== undefined) {
+      this.requireOwnedSession(request.beforeSessionId, principal)
+    }
     try {
       await workspace.insertSessionBefore(request.sessionId, request.beforeSessionId)
     } catch (error) {
@@ -142,7 +155,7 @@ export class WorkspaceCommands {
         { cause: error },
       )
     }
-    return { workspace: workspaceView(workspace) }
+    return { workspace: workspaceView(workspace, this.visible(principal)) }
   }
 
   /**
@@ -151,13 +164,34 @@ export class WorkspaceCommands {
    * @returns the complete resulting archive set.
    */
   async archiveSession(request: WorkspaceArchiveSessionRequest): Promise<WorkspaceArchiveValue> {
+    const principal = currentRequestPrincipal(this.ctx)
+    this.requireOwnedSession(request.sessionId, principal)
     try {
       await this.ctx.workspaceRegistry.archiveSession(request.sessionId)
     } catch (error) {
       if (!(error instanceof WorkspaceUnknownSessionError)) throw error
       throw new RemoteError('session/not-found', error.message, { sessionId: request.sessionId }, { cause: error })
     }
-    return { archivedSessionIds: [...this.ctx.workspaceRegistry.archivedSessionIds] }
+    return {
+      archivedSessionIds: this.ctx.workspaceRegistry.archivedSessionIds.filter(this.visible(principal)),
+    }
+  }
+
+  private visible(principal: RequestPrincipal | undefined): (sessionId: string) => boolean {
+    return sessionId => requestPrincipalOwns(
+      principal,
+      this.ctx.workspaceRegistry.sessionHeader(sessionId as SessionId)?.ownerUserId,
+    )
+  }
+
+  private requireOwnedSession(
+    sessionId: SessionId,
+    principal: RequestPrincipal | undefined,
+  ): void {
+    const header = this.ctx.workspaceRegistry.sessionHeader(sessionId)
+    if (!requestPrincipalOwns(principal, header?.ownerUserId)) {
+      throw new RemoteError('session/not-found', `session "${sessionId}" not found`, { sessionId })
+    }
   }
 
   private requireWorkspace(workspaceId: WorkspaceId): Workspace {

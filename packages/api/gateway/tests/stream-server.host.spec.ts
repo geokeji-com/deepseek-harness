@@ -2,6 +2,7 @@ import { once } from 'node:events'
 import { createServer, type Server } from 'node:http'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import WebSocket from 'ws'
+import { toUserId, type RequestPrincipal } from '@deepseek-ai/dsh-client-connection'
 import {
   RemoteStreamMuxServer,
   type RemoteStreamFailureMapper,
@@ -25,6 +26,33 @@ afterEach(async () => {
 })
 
 describe('Remote stream mux server carrier lifecycle', () => {
+  it('passes the accepted upgrade principal to every stream opener', async () => {
+    const principal: RequestPrincipal = {
+      userId: toUserId('member-a'),
+      issuedAt: 1,
+      expiresAt: Number.MAX_SAFE_INTEGER,
+    }
+    let opened!: () => void
+    const didOpen = new Promise<void>((resolve) => { opened = resolve })
+    const seen: RequestPrincipal[] = []
+    const entry = await startMux(
+      async (_endpoint, _payload, signal, requestPrincipal) => {
+        if (requestPrincipal !== undefined) seen.push(requestPrincipal)
+        opened()
+        return waitForAbort(signal)
+      },
+      2_000,
+      principal,
+    )
+    const client = await connect(entry.url)
+    client.send(openFrame('principal'))
+    await didOpen
+
+    expect(seen).toEqual([principal])
+    client.close()
+    await once(client, 'close')
+  })
+
   it('sends WebSocket Ping control frames without application messages', async () => {
     const entry = await startMux(async (_endpoint, _payload, signal) => waitForAbort(signal), 20)
     const client = await connect(entry.url)
@@ -234,10 +262,16 @@ const mapFailure: RemoteStreamFailureMapper = error => ({
   details: {},
 })
 
-async function startMux(open: RemoteStreamOpener, heartbeatIntervalMs = 2_000): Promise<RunningMux> {
+async function startMux(
+  open: RemoteStreamOpener,
+  heartbeatIntervalMs = 2_000,
+  principal?: RequestPrincipal,
+): Promise<RunningMux> {
   const mux = new RemoteStreamMuxServer(open, mapFailure, heartbeatIntervalMs)
   const http = createServer()
-  http.on('upgrade', (request, socket, head) => { mux.handleUpgrade(request, socket, head) })
+  http.on('upgrade', (request, socket, head) => {
+    mux.handleUpgrade(request, socket, head, principal)
+  })
   await new Promise<void>((resolve, reject) => {
     http.once('error', reject)
     http.listen(0, '127.0.0.1', () => {

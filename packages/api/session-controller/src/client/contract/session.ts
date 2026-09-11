@@ -103,7 +103,11 @@ export interface ISession {
    * @param action - requested queue operation.
    * @returns acceptance, or a business/transport error.
    */
-  updateQueue(itemId: MessageId, action: QueueAction): Promise<RemoteResult<{ accepted: true }>>
+  updateQueue(
+    itemId: MessageId,
+    action: QueueAction,
+    signal?: AbortSignal,
+  ): Promise<RemoteResult<{ accepted: true }>>
   /**
    * Cancel the running turn. Pending queued work remains and resumes in FIFO
    * order after the Host reaches cancellation quiescence.

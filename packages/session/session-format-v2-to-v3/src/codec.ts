@@ -79,10 +79,13 @@ export const releasedV3SessionFormatCodec = Object.freeze({
  * Validate owned V3 admission rules before a scanner or codec can discard a recoverable tail.
  * This checks only identified structural payloads; physical provenance still belongs to decoding.
  * @param row - parsed physical row, before envelope or compressed-range decoding.
+ * @param formatVersion - physical format version named by admission errors.
  */
-export function assertV3RowAdmission(row: unknown): void {
+export function assertV3RowAdmission(row: unknown, formatVersion = 3): void {
   assertV3StructuralRow(row)
-  if (typeof row === 'object' && row !== null && !Array.isArray(row)) assertV3EventAdmission(row as SessionFormatEvent)
+  if (typeof row === 'object' && row !== null && !Array.isArray(row)) {
+    assertV3EventAdmission(row as SessionFormatEvent, formatVersion)
+  }
 }
 
 function v2PhysicalHeader(value: unknown): SessionFormatHeader {

@@ -101,7 +101,7 @@ describe.skipIf(!requiredArtifacts)('Goal Remote built LIB chain', () => {
           send() {},
           updateInbox() { return 'not-found' },
           followup() {},
-          steer() { return { outcome: Promise.resolve({ status: 'rejected' }) } },
+          steer() {},
           inject(input) { session.append('user/message', input, { surfaceOp: 'append' }) },
           reserveTurnAdmission() {},
           cancel() {},

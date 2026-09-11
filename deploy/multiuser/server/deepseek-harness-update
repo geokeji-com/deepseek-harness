@@ -13,6 +13,11 @@ old_commit=""
 patch_applied=0
 instances_stopped=0
 trace_id="update-$(date -u +%Y%m%dT%H%M%SZ)"
+BACKEND_MODE="legacy"
+if [[ -f "/home/dsh/.config/deepseek-harness/multiuser/multiuser.env" ]]; then
+  # shellcheck disable=SC1091
+  source "/home/dsh/.config/deepseek-harness/multiuser/multiuser.env"
+fi
 
 log_event() {
   local event="$1" level="$2" status="$3" reason="$4"
@@ -69,6 +74,9 @@ rollback() {
     fi
   fi
   if [[ "$instances_stopped" -eq 1 ]]; then
+    if [[ "$BACKEND_MODE" == "shared" ]]; then
+      systemctl --user restart dsh-shared-harness.service >/dev/null 2>&1 || true
+    fi
     systemctl --user restart dsh-multiuser.service >/dev/null 2>&1 || true
   fi
   if [[ "$rollback_ok" -eq 1 ]]; then
@@ -120,9 +128,13 @@ fi
 
 new_commit="$(git rev-parse HEAD)"
 instances_stopped=1
-for user in owner member2 member3 member4; do
-  systemctl --user stop "deepseek-harness-user@$user.service" >/dev/null 2>&1 || true
-done
+if [[ "$BACKEND_MODE" == "shared" ]]; then
+  systemctl --user restart dsh-shared-harness.service
+else
+  for user in owner member2 member3 member4; do
+    systemctl --user stop "deepseek-harness-user@$user.service" >/dev/null 2>&1 || true
+  done
+fi
 systemctl --user restart dsh-multiuser.service
 
 healthy=0

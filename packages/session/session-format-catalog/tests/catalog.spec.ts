@@ -1,5 +1,15 @@
 import { describe, expect, it } from 'vitest'
+import { createSessionFormatCatalog } from '@deepseek-ai/dsh-session-format'
 import type { SessionFormatEvent } from '@deepseek-ai/dsh-session-format'
+import { releasedV0SessionFormatCodec, sessionFormatV0ToV1 } from '@deepseek-ai/dsh-session-format-v0-to-v1'
+import { releasedV1SessionFormatCodec, sessionFormatV1ToV2 } from '@deepseek-ai/dsh-session-format-v1-to-v2'
+import {
+  assertReleasedV3Header,
+  releasedV2SessionFormatCodec,
+  releasedV3SessionFormatCodec,
+  restoreReleasedV3Artifact,
+  sessionFormatV2ToV3,
+} from '@deepseek-ai/dsh-session-format-v2-to-v3'
 import { sessionFormatCatalog } from '../src/index.ts'
 
 function deepFreeze<T>(value: T): T {
@@ -10,8 +20,26 @@ function deepFreeze<T>(value: T): T {
   return value
 }
 
+const historicalV3Catalog = createSessionFormatCatalog({
+  currentVersion: 3,
+  codecs: [
+    releasedV0SessionFormatCodec,
+    releasedV1SessionFormatCodec,
+    releasedV2SessionFormatCodec,
+    releasedV3SessionFormatCodec,
+  ],
+  currentEncoder: releasedV3SessionFormatCodec,
+  migrations: [sessionFormatV0ToV1, sessionFormatV1ToV2, sessionFormatV2ToV3],
+  restoreCurrent: artifact => restoreReleasedV3Artifact(artifact, new Set()),
+  restoreTransformedCurrent: artifact => restoreReleasedV3Artifact(artifact, new Set()),
+  restoreCurrentHeader(header) {
+    assertReleasedV3Header(header)
+    return header
+  },
+})
+
 describe('first-party Session format catalog', () => {
-  it('statically owns the complete adjacent v0 to v3 chain', () => {
+  it('statically owns the complete v0 to v4 chain but refuses implicit v3 owner assignment', () => {
     const header = {
       type: 'session',
       version: 0,
@@ -21,33 +49,24 @@ describe('first-party Session format catalog', () => {
       delegationDepth: 0,
     }
 
-    expect(sessionFormatCatalog.currentVersion).toBe(3)
+    expect(sessionFormatCatalog.currentVersion).toBe(4)
     expect(sessionFormatCatalog.readHeader(header)).toEqual({
-      status: 'migration-required',
+      status: 'unsupported',
       storedVersion: 0,
-      targetVersion: 3,
-      header: {
-        version: 3,
-        id: 'catalog',
-        createdAt: 1,
-        isSeeded: true,
-        delegationDepth: 0,
-      },
+      targetVersion: 4,
+      reason: 'format v3 has no ownerUserId; run the owner-aware migration tool to publish a new format v4 generation',
     })
 
     const v1Header = { ...header, version: 1 }
-    const restore = sessionFormatCatalog.createRestore(v1Header, {
+    expect(() => sessionFormatCatalog.createRestore(v1Header, {
       recovery: 'strict', validation: 'current',
-    })
-    restore.decodeRow({ type: 'turn/start', seq: 0, time: 2, data: { turn: 1 } })
-    expect(restore.finish()).toMatchObject({
-      header: { version: 3, id: 'catalog' },
-    })
+    })).toThrow(/owner-aware migration tool/)
   })
 
   it('restores the installed current vocabulary without freezing ordinary payload additions', () => {
     const header = {
-      type: 'session', version: 3, id: 'current-growth', createdAt: 1, isSeeded: false, delegationDepth: 0,
+      type: 'session', version: 4, id: 'current-growth', ownerUserId: 'principal-a',
+      createdAt: 1, isSeeded: false, delegationDepth: 0,
     }
     const restore = (rows: readonly unknown[]) => {
       const current = sessionFormatCatalog.createRestore(header, {
@@ -81,7 +100,7 @@ describe('first-party Session format catalog', () => {
         type: 'session', version, id: 'seed-chain', createdAt: 1,
         parentSession: 'parent', seedLength, delegationDepth: 0,
       }
-      const restore = sessionFormatCatalog.createRestore(sourceHeader, { recovery: 'strict', validation: 'current' })
+      const restore = historicalV3Catalog.createRestore(sourceHeader, { recovery: 'strict', validation: 'current' })
       if (seedLength > 0) {
         restore.decodeRow({ type: 'feedback/record', seq: 0, time: 1, data: { text: 'inherited' } })
       }
@@ -104,7 +123,7 @@ describe('first-party Session format catalog', () => {
       ...(isSeeded ? [{ type: 'session/end-seed', seq: 3, time: 4, data: { inherited: true } }] : []),
     ]
     const before = JSON.stringify({ header, rows })
-    const restore = sessionFormatCatalog.createRestore(header, { recovery: 'strict', validation: 'current' })
+    const restore = historicalV3Catalog.createRestore(header, { recovery: 'strict', validation: 'current' })
     for (const row of rows) restore.decodeRow(row)
     expect(restore.finish()).toEqual({
       header: { version: 3, id: 'v2-identity', createdAt: 1, isSeeded, delegationDepth: 0 },
@@ -133,7 +152,7 @@ describe('first-party Session format catalog', () => {
     const header = { type: 'session', version: 2, id: 'v2-unknown', createdAt: 1, isSeeded: false, delegationDepth: 0 }
     const row = { type: 'external/event', seq: 0, time: 1, data: { extra: ['unchanged'] }, ignorable: true }
     const before = JSON.stringify({ header, row })
-    const restore = sessionFormatCatalog.createRestore(header, { recovery: 'strict', validation })
+    const restore = historicalV3Catalog.createRestore(header, { recovery: 'strict', validation })
     expect(() => { restore.decodeRow(row) }).toThrow(/cannot safely transform unclassified event external\/event/)
     expect(JSON.stringify({ header, row })).toBe(before)
   })
@@ -168,7 +187,7 @@ describe('first-party Session format catalog', () => {
       { type: 'turn/end', seq: 9, time: 17, data: { turn: 1, reason: { kind: 'completed' } } },
     ])
     const before = JSON.stringify({ sourceHeader, rows })
-    const restore = sessionFormatCatalog.createRestore(sourceHeader, { recovery: 'strict', validation: 'current' })
+    const restore = historicalV3Catalog.createRestore(sourceHeader, { recovery: 'strict', validation: 'current' })
     for (const row of rows) restore.decodeRow(row)
     const artifact = restore.finish()
     const renamedMessage = (id: string) => ({ ...message(id), source: { kind: 'plugin', plugin: 'tools-ptc' } })
@@ -187,10 +206,10 @@ describe('first-party Session format catalog', () => {
       header: { version: 3, id: sourceHeader.id, createdAt: 1, isSeeded: false, delegationDepth: 0 },
       inheritedEventCount: 0, events: expected,
     })
-    const currentHeader = deepFreeze(sessionFormatCatalog.encodeCurrentHeader(artifact.header, artifact.inheritedEventCount))
-    const currentRows = deepFreeze(artifact.events.map(event => sessionFormatCatalog.encodeCurrentEvent(event)))
+    const currentHeader = deepFreeze(historicalV3Catalog.encodeCurrentHeader(artifact.header, artifact.inheritedEventCount))
+    const currentRows = deepFreeze(artifact.events.map(event => historicalV3Catalog.encodeCurrentEvent(event)))
     const encodedBefore = JSON.stringify({ currentHeader, currentRows })
-    const reopened = sessionFormatCatalog.createRestore(currentHeader, { recovery: 'strict', validation: 'current' })
+    const reopened = historicalV3Catalog.createRestore(currentHeader, { recovery: 'strict', validation: 'current' })
     for (const row of currentRows) reopened.decodeRow(row)
     expect(reopened.finish()).toEqual(artifact)
     expect(JSON.stringify({ sourceHeader, rows })).toBe(before)
@@ -198,7 +217,10 @@ describe('first-party Session format catalog', () => {
   })
 
   it.each(['current', 'transformed'] as const)('rejects native v3 obsolete required tags with %s validation and retains ignorable tags', (validation) => {
-    const header = deepFreeze({ type: 'session', version: 3, id: 'native-ptc', createdAt: 1, isSeeded: false, delegationDepth: 0 })
+    const header = deepFreeze({
+      type: 'session', version: 4, id: 'native-ptc', ownerUserId: 'principal-a',
+      createdAt: 1, isSeeded: false, delegationDepth: 0,
+    })
     for (const type of ['tool/code-dispatch-start', 'tool/code-dispatch']) {
       const required = deepFreeze({ type, seq: 0, time: 1, data: null })
       const rejected = sessionFormatCatalog.createRestore(header, { recovery: 'strict', validation })
@@ -214,7 +236,7 @@ describe('first-party Session format catalog', () => {
     const header = deepFreeze({ type: 'session', version: 2, id: 'v2-collision', createdAt: 1, isSeeded: false, delegationDepth: 0 })
     for (const type of ['tool/ptc-dispatch-start', 'tool/ptc-dispatch']) {
       for (const ignorable of [false, true]) {
-        const restore = sessionFormatCatalog.createRestore(header, { recovery: 'strict', validation })
+        const restore = historicalV3Catalog.createRestore(header, { recovery: 'strict', validation })
         const row = deepFreeze({ type, seq: 0, time: 1, data: null, ...(ignorable ? { ignorable: true } : {}) })
         expect(() => { restore.decodeRow(row) }).toThrow(/format v2.*ptc-dispatch/)
       }
@@ -229,7 +251,7 @@ describe('first-party Session format catalog', () => {
       { type: 'tool/code-dispatch-start', seq: 1, time: 2, data, ignorable: true },
       { type: 'tool/code-dispatch', seq: 2, time: 3, data: { ...data, isError: false, content: [] }, ignorable: true },
     ])
-    const restore = sessionFormatCatalog.createRestore(header, { recovery: 'strict', validation })
+    const restore = historicalV3Catalog.createRestore(header, { recovery: 'strict', validation })
     for (const row of rows) restore.decodeRow(row)
     expect(restore.finish().events).toEqual([
       rows[0], { ...rows[1], type: 'tool/ptc-dispatch-start' }, { ...rows[2], type: 'tool/ptc-dispatch' },
@@ -238,7 +260,7 @@ describe('first-party Session format catalog', () => {
 
   it.each(['current', 'transformed'] as const)('refuses a v3 delivery marker in v2 input (%s)', (validation) => {
     const header = { type: 'session', version: 2, id: 'future-delivery', createdAt: 1, isSeeded: false, delegationDepth: 0 }
-    const restore = sessionFormatCatalog.createRestore(header, { recovery: 'strict', validation })
+    const restore = historicalV3Catalog.createRestore(header, { recovery: 'strict', validation })
     restore.decodeRow({ type: 'feedback/record', seq: 0, time: 1, data: { text: 'unaccepted' } })
     expect(() => {
       restore.decodeRow({ type: 'session-log-deepseek/delivery-accepted', seq: 1, time: 2,
@@ -248,7 +270,7 @@ describe('first-party Session format catalog', () => {
   })
 
   it('validates complete relationships after streaming migration', () => {
-    const stream = sessionFormatCatalog.createRestore({
+    const stream = historicalV3Catalog.createRestore({
       type: 'session', version: 1, id: 'invalid-stream', createdAt: 1, delegationDepth: 0,
     }, { recovery: 'strict', validation: 'current' })
     stream.decodeRow({ type: 'step/start', seq: 0, time: 2, data: { turn: 1, step: 1 } })

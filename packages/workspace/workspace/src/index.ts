@@ -172,6 +172,20 @@ export class WorkspaceRegistry extends Service {
   }
 
   /**
+   * Read one header already indexed by persistence or live-Session startup.
+   * @param id - Session identity.
+   * @returns the indexed header, or undefined when the Session is unknown.
+   */
+  sessionHeader(id: SessionId): SessionHeader | undefined {
+    const live = this.ctx.get('sessions')?.get(id)
+    if (live !== undefined) {
+      this.headers.set(id, live.header)
+      return live.header
+    }
+    return this.headers.get(id)
+  }
+
+  /**
    * Synchronous workspace projection in durable registry order. Every
    * entity's `sessionIds` getter is already filtered by the startup/live
    * canonical-cwd header index; this method performs no persistence reads.

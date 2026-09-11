@@ -1,7 +1,13 @@
 /** Reconnect-safe Workspace baseline and increment producer. */
 
 import type { Context } from '@deepseek-ai/cordis'
+import {
+  currentRequestPrincipal,
+  requestPrincipalOwns,
+  type RequestPrincipal,
+} from '@deepseek-ai/dsh-client-connection'
 import { Deque } from '@deepseek-ai/dsh-deque'
+import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { DomainChanged } from '@deepseek-ai/dsh-storage-domain'
 import type { Workspace, WorkspaceRecord } from '@deepseek-ai/dsh-workspace'
 import {
@@ -18,14 +24,18 @@ import type {
 /**
  * Project one authoritative Workspace entity into its Remote value.
  * @param workspace - authoritative registry entity.
+ * @param visible - predicate applied to each Session identity.
  * @returns detached Workspace projection for Remote consumers.
  */
-export function workspaceView(workspace: Workspace): WorkspaceView {
+export function workspaceView(
+  workspace: Workspace,
+  visible: (sessionId: string) => boolean = () => true,
+): WorkspaceView {
   return {
     workspaceId: workspace.id,
     path: workspace.path,
     title: workspace.title,
-    sessionIds: [...workspace.sessionIds],
+    sessionIds: workspace.sessionIds.filter(visible),
     createdAt: workspace.createdAt,
     updatedAt: workspace.updatedAt,
   }
@@ -67,10 +77,14 @@ export class WorkspaceFeed {
    * Read the complete current projection synchronously.
    * @returns all active Workspaces and archived Session identities.
    */
-  baseline(): WorkspaceBaseline {
+  baseline(principal?: RequestPrincipal): WorkspaceBaseline {
+    const visible = (sessionId: string): boolean => requestPrincipalOwns(
+      principal,
+      this.ctx.workspaceRegistry.sessionHeader(sessionId as SessionId)?.ownerUserId,
+    )
     return {
-      items: this.ctx.workspaceRegistry.list().map(workspaceView),
-      archivedSessionIds: [...this.ctx.workspaceRegistry.archivedSessionIds],
+      items: this.ctx.workspaceRegistry.list().map(workspace => workspaceView(workspace, visible)),
+      archivedSessionIds: this.ctx.workspaceRegistry.archivedSessionIds.filter(visible),
     }
   }
 
@@ -81,10 +95,14 @@ export class WorkspaceFeed {
    */
   async *follow(signal: AbortSignal): AsyncIterable<WorkspaceFollowFrame> {
     signal.throwIfAborted()
-    const follower = new WorkspaceFollower()
+    const principal = currentRequestPrincipal(this.ctx)
+    const follower = new WorkspaceFollower(sessionId => requestPrincipalOwns(
+      principal,
+      this.ctx.workspaceRegistry.sessionHeader(sessionId as SessionId)?.ownerUserId,
+    ))
     this.followers.add(follower)
     try {
-      yield { type: 'baseline', value: this.baseline() }
+      yield { type: 'baseline', value: this.baseline(principal) }
       yield* follower.read(signal)
     } finally {
       this.followers.delete(follower)
@@ -144,11 +162,34 @@ class WorkspaceFollower {
   private waiting: (() => void) | undefined
   private closed = false
 
+  constructor(
+    private readonly visible: (sessionId: string) => boolean,
+  ) {}
+
   push(frame: WorkspaceFollowFrame): void {
     /* v8 ignore next -- closed followers are removed before later publication can reach them. */
     if (this.closed) return
-    this.frames.pushBack(frame)
+    this.frames.pushBack(this.project(frame))
     this.waiting?.()
+  }
+
+  private project(frame: WorkspaceFollowFrame): WorkspaceFollowFrame {
+    if (frame.type === 'upsert') {
+      return {
+        ...frame,
+        workspace: {
+          ...frame.workspace,
+          sessionIds: frame.workspace.sessionIds.filter(this.visible),
+        },
+      }
+    }
+    if (frame.type === 'archived') {
+      return {
+        ...frame,
+        archivedSessionIds: frame.archivedSessionIds.filter(this.visible),
+      }
+    }
+    return frame
   }
 
   close(): void {

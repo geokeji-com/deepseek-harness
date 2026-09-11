@@ -14,6 +14,7 @@ import { generationLogPath, type JsonlCompression } from '../src/format.ts'
 import { compressZstdFrame } from '../src/zstd.ts'
 
 const id = SessionId('migration-refusal')
+const ownerRequired = 'format v3 has no ownerUserId; run the owner-aware migration tool to publish a new format v4 generation'
 const config = { provider: 'historical', model: 'historical-model' }
 const question = {
   id: 'question', role: 'user', source: { kind: 'user' },
@@ -51,14 +52,12 @@ const migrationRefusals = [
   ...['tool/ptc-dispatch-start', 'tool/ptc-dispatch'].flatMap(type => [false, true].map(ignorable => ({
     name: type + (ignorable ? ' (ignorable)' : ' (required)'),
     tail: { ...ptcRow(type), ...(ignorable ? { ignorable: true } : {}) },
-    diagnostic: 'format v2 to v3 cannot safely transform unclassified event ' + type,
   }))),
   {
     name: 'delivery activation claiming V3',
     tail: { type: 'session-log-deepseek/delivery-accepted', data: {
       sessionId: id, throughSeq: prefix.length - 1, sessionFormatVersion: 3,
     } },
-    diagnostic: '@deepseek-ai/dsh-session-format-v2-to-v3 refuses this format v2 Session: format v2 delivery marker claims target format v3',
   },
   {
     name: 'source message colliding with the generated system ID',
@@ -67,15 +66,14 @@ const migrationRefusals = [
       id: 'v2-to-v3-system-' + createHash('sha256')
         .update(JSON.stringify(['session-format-v2-to-v3', id, 1, 'step/start'])).digest('hex'),
     } },
-    diagnostic: 'source message id collides with a generated system message id',
   },
-] satisfies readonly { name: string; tail: SessionFormatJsonObject; diagnostic: string }[]
+] satisfies readonly { name: string; tail: SessionFormatJsonObject }[]
 
 const nativeRefusals = [
   ...['tool/code-dispatch-start', 'tool/code-dispatch'].map(type => ({
     name: type,
     tail: ptcRow(type),
-    diagnostic: 'format v3 contains unknown event type ' + JSON.stringify(type) + ' at seq ' + String(nativePrefix.length),
+    diagnostic: 'format v4 contains unknown event type ' + JSON.stringify(type) + ' at seq ' + String(nativePrefix.length),
   })),
   {
     name: 'retired request/header.system',
@@ -116,9 +114,13 @@ function line(value: unknown): string {
   return JSON.stringify(value) + '\n'
 }
 
-async function store(version: 2 | 3, compression: JsonlCompression, rows: readonly SessionFormatJsonObject[]) {
+async function store(version: 2 | 4, compression: JsonlCompression, rows: readonly SessionFormatJsonObject[]) {
   const path = generationLogPath(root, undefined, id, version, compression)
-  const header = { type: 'session', version, id, createdAt: 1000, isSeeded: false, delegationDepth: 0 }
+  const header = {
+    type: 'session', version, id,
+    ...(version === 4 ? { ownerUserId: 'migration-refusal-owner' } : {}),
+    createdAt: 1000, isSeeded: false, delegationDepth: 0,
+  }
   const events = rows.map((row, seq) => ({ ...row, seq, time: 1001 + seq }))
   // The offending EOF row occupies its own complete frame, not a torn compressed suffix.
   const chunks = [line(header), events.slice(0, -1).map(line).join(''), line(events.at(-1))]
@@ -140,8 +142,16 @@ async function observe(path: string) {
 async function expectRefusal(ctx: Context, access: 'read' | 'write', path: string, message: string) {
   // Close an unexpectedly successful open before the rejection assertion fails.
   const opened = ctx.sessionPersistence.open(id, access).then(async (handle) => { await handle.close() })
-  await expect(opened).rejects.toBeInstanceOf(SessionFormatUnsupportedError)
-  await expect(opened).rejects.toMatchObject({ message, location: { kind: 'jsonl', path } })
+  let refusal: SessionFormatUnsupportedError | undefined
+  try {
+    await opened
+  } catch (error) {
+    if (error instanceof SessionFormatUnsupportedError) refusal = error
+    else throw error
+  }
+  expect(refusal).toBeInstanceOf(SessionFormatUnsupportedError)
+  expect(refusal?.message).toContain(message)
+  expect(refusal?.location).toEqual({ kind: 'jsonl', path })
 }
 
 async function expectOnlyGenerations(paths: readonly string[]) {
@@ -152,48 +162,46 @@ async function expectOnlyGenerations(paths: readonly string[]) {
 }
 
 describe.each(modes)('EOF migration refusal ($compression, $access)', ({ compression, access }) => {
-  it.each(migrationRefusals)('refuses V2 $name without publishing or discarding a tail', async ({ tail, diagnostic }) => {
+  it.each(migrationRefusals)('refuses V2 $name without publishing or discarding a tail', async ({ tail }) => {
     const path = await store(2, compression, [...prefix, tail])
     const original = await observe(path)
-    const message = diagnostic + '; source v2 artifact remains unchanged (raw log: ' + path + ')'
     const ctx = await mount(compression)
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      await expectRefusal(ctx, access, path, message)
+      await expectRefusal(ctx, access, path, ownerRequired)
       expect(await observe(path)).toEqual(original)
       await expectOnlyGenerations([path])
       for (const targetCompression of ['none', 'zstd'] as const) {
-        await expect(stat(generationLogPath(root, undefined, id, 3, targetCompression)))
+        await expect(stat(generationLogPath(root, undefined, id, 4, targetCompression)))
           .rejects.toMatchObject({ code: 'ENOENT' })
       }
     }
   })
 
-  it.each(nativeRefusals)('refuses native V3 $name instead of falling back to readable V2', async ({ tail, diagnostic }) => {
-    const lowerPath = await store(2, compression, prefix)
-    const lower = await observe(lowerPath)
+  it.each(nativeRefusals)('refuses native V4 $name without discarding a committed tail', async ({ tail, diagnostic }) => {
+    const path = await store(4, compression, nativePrefix)
+    const valid = await observe(path)
     const ctx = await mount(compression)
     const reader = await ctx.sessionPersistence.open(id, 'read')
     try {
-      expect(reader.header.version).toBe(3)
+      expect(reader.header.version).toBe(4)
       const restored = await reader.read()
       expect(restored.events.map(event => event.type)).toEqual([
-        'turn/start', 'step/start', 'system/message', 'user/message', 'system/message', 'request/header',
+        'turn/start', 'step/start', 'system/message', 'user/message', 'request/header',
       ])
       expect(restored.events.find(event => event.type === 'user/message')?.data).toEqual(question)
     } finally {
       await reader.close()
     }
-    expect(await observe(lowerPath)).toEqual(lower)
-    await expectOnlyGenerations([lowerPath])
+    expect(await observe(path)).toEqual(valid)
+    await expectOnlyGenerations([path])
 
-    const path = await store(3, compression, [...nativePrefix, tail])
+    await store(4, compression, [...nativePrefix, tail])
     const original = await observe(path)
     const message = diagnostic + ' (raw log: ' + path + ')'
     for (let attempt = 0; attempt < 2; attempt += 1) {
       await expectRefusal(ctx, access, path, message)
       expect(await observe(path)).toEqual(original)
-      expect(await observe(lowerPath)).toEqual(lower)
-      await expectOnlyGenerations([lowerPath, path])
+      await expectOnlyGenerations([path])
     }
   })
 })

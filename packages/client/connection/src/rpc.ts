@@ -5,6 +5,16 @@ import type { Branded } from '@deepseek-ai/dsh-brand'
 /** Correlation id minted by a caller and echoed by the Connection response. */
 export type RpcId = Branded<'rpc-id'>
 
+/** Stable identity of one authenticated Harness user. */
+export type UserId = Branded<'UserId'>
+
+/** Verified identity carried by one HTTP request or WebSocket upgrade. */
+export interface RequestPrincipal {
+  readonly userId: UserId
+  readonly issuedAt: number
+  readonly expiresAt: number
+}
+
 /**
  * Brand one validated string as a Connection correlation id.
  * @param id - validated wire identity.
@@ -79,6 +89,12 @@ export type RpcMessage = ClientRequest | ServerResponse
 export interface ConnectionTrustRequest {
   /** Request headers supplied by either the Fetch or node:http representation. */
   readonly headers: Headers | Readonly<Record<string, string | readonly string[] | undefined>>
+  /** Peer address when the carrier exposes it. */
+  readonly remoteAddress?: string | undefined
+  /** HTTP method when the carrier exposes it. */
+  readonly method?: string | undefined
+  /** Request URL or path when the carrier exposes it. */
+  readonly url?: string | undefined
 }
 
 /** HTTP status returned before dispatch, or undefined when the request may proceed. */
@@ -101,6 +117,7 @@ export type ConnectionRpcHandler = (
   endpoint: string,
   payload: unknown,
   signal: AbortSignal,
+  principal?: RequestPrincipal,
 ) => Promise<ConnectionRpcResult<unknown>>
 
 /** Synchronous ownership test for one endpoint on a shared RPC channel. */
@@ -121,7 +138,7 @@ export interface ConnectionFetchRoute {
   /** Buffered requests obey the configured JSON cap; streaming requests arrive with backpressure and no aggregate cap. */
   readonly requestBody: ConnectionRequestBodyMode
   /** Handle one request after the physical carrier has applied its trust and authentication policy. */
-  readonly fetch: (request: Request) => Promise<Response>
+  readonly fetch: (request: Request, principal?: RequestPrincipal) => Promise<Response>
 }
 
 /** Host registry for exact Fetch routes that cannot use JSON Remote invocation. */
@@ -182,6 +199,13 @@ export interface HostConnectionHandle {
    * @returns rejection status, or undefined when the route may accept the request.
    */
   requestRejection(request: ConnectionTrustRequest): ConnectionRequestRejection
+
+  /**
+   * Verify the deployment principal carried by one request.
+   * @param request - request headers and optional peer address.
+   * @returns verified principal, or undefined when absent or invalid.
+   */
+  requestPrincipal(request: ConnectionTrustRequest): RequestPrincipal | undefined
 
   /**
    * Authenticate one frontend index request, owning a token redirect or 401.

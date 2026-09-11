@@ -47,10 +47,17 @@ export function apply(ctx: Context): void {
 function remoteEventSource(ctx: Context): TypertRemoteEventSource {
   return (signal) => {
     const queue = new RemoteEventQueue()
+    const sessionOwners = new Map<string, string>()
     const disposers = API_REMOTE_FORWARDED_EVENTS.map(({ event, mode }) => {
       if (mode === 'emit') {
         return ctx.on(event as never, ((...args: unknown[]) => {
-          queue.push({ event, args: assertJsonArgs(event, args) })
+          const jsonArgs = assertJsonArgs(event, args)
+          const ownerUserId = forwardedEventOwner(ctx, sessionOwners, event, jsonArgs)
+          queue.push({
+            event,
+            args: jsonArgs,
+            ...(ownerUserId === undefined ? {} : { ownerUserId }),
+          })
         }) as never)
       }
       return ctx.on(event as never, (function (
@@ -68,7 +75,14 @@ function remoteEventSource(ctx: Context): TypertRemoteEventSource {
           queue,
           event,
           request,
-          { value: agent.ctx, subject: agent, agentId: agent.id },
+          {
+            value: agent.ctx,
+            subject: agent,
+            agentId: agent.id,
+            ...(agent.session.header.ownerUserId === undefined
+              ? {}
+              : { ownerUserId: agent.session.header.ownerUserId }),
+          },
           next,
         )
       }) as never)
@@ -77,6 +91,56 @@ function remoteEventSource(ctx: Context): TypertRemoteEventSource {
       for (const dispose of disposers) dispose()
     })
   }
+}
+
+/**
+ * Resolve the Session owner for one forwarded event without exposing owner
+ * metadata on the browser wire.
+ * @param ctx - Host context carrying live Sessions.
+ * @param owners - owner values remembered across lifecycle events.
+ * @param event - forwarded Host event name.
+ * @param args - lossless JSON event arguments.
+ * @returns durable owner identity for a Session-scoped event.
+ */
+function forwardedEventOwner(
+  ctx: Context,
+  owners: Map<string, string>,
+  event: string,
+  args: readonly unknown[],
+): string | undefined {
+  const sessionId = forwardedSessionId(event, args)
+  if (sessionId === undefined) return undefined
+  const liveOwner = ctx.get('sessions')?.get(sessionId as never)?.header.ownerUserId
+  if (liveOwner !== undefined) owners.set(sessionId, liveOwner)
+  return liveOwner ?? owners.get(sessionId)
+}
+
+/** Extract the Session identity carried by an allowlisted event. */
+function forwardedSessionId(event: string, args: readonly unknown[]): string | undefined {
+  if (event === 'api-session/added') {
+    const summary = record(args[0])
+    return typeof summary?.sessionId === 'string' ? summary.sessionId : undefined
+  }
+  if (event === 'api-session/activity'
+    || event === 'api-session/error'
+    || event === 'api-session/removed'
+    || event === 'api-session/status'
+    || event === 'agent-preset/selected') {
+    return typeof args[0] === 'string' ? args[0] : undefined
+  }
+  if (event === 'goal/activation-changed') {
+    const payload = record(args[0])
+    if (typeof payload?.sessionId === 'string') return payload.sessionId
+    const goal = record(payload?.goal)
+    return typeof goal?.sessionId === 'string' ? goal.sessionId : undefined
+  }
+  return undefined
+}
+
+function record(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
 }
 
 /** One pull-driven queue bridging synchronous Cordis listeners to an AsyncIterable. */

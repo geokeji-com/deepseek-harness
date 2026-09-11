@@ -9,7 +9,11 @@ import { API_PATH } from './api-path.ts'
 import { bridge, DEFAULT_MAX_REQUEST_BODY_BYTES } from './http-bridge.ts'
 import { assertTrustedAuthority } from './api-request-trust.ts'
 import { BrowserAuth } from './browser-auth.ts'
-import { HostConnectionService } from './rpc-host.ts'
+import {
+  RequestPrincipalService,
+  type RequestPrincipalConfig,
+} from './principal.ts'
+import { HostConnectionService, nodeTrustRequest } from './rpc-host.ts'
 import { ConnectionRecoveryConfigSchema, resolveConnectionConfig, type ConnectionRecoveryConfig } from './recovery-config.ts'
 
 export type {
@@ -29,8 +33,10 @@ export type {
   HostConnectionHandle,
   HostConnectionFetch,
   HostConnectionRpc,
+  RequestPrincipal,
   RpcMessage,
   ServerResponse,
+  UserId,
 } from './rpc.ts'
 export { RpcId, transportError } from './rpc.ts'
 export {
@@ -41,7 +47,14 @@ export {
   rpcResultSchema,
   serverResponseSchema,
 } from './rpc-schema.ts'
-export { HostConnectionService } from './rpc-host.ts'
+export { HostConnectionService, nodeTrustRequest } from './rpc-host.ts'
+export {
+  currentRequestPrincipal,
+  requestPrincipalOwns,
+  RequestPrincipalService,
+  UserId as toUserId,
+} from './principal.ts'
+export type { RequestPrincipalConfig } from './principal.ts'
 
 export { API_PATH } from './api-path.ts'
 
@@ -85,6 +98,8 @@ export interface ConnectionConfig {
   cookieMaxAgeDays?: number
   /** Maximum buffered JSON body for every `/api` request. Default: 300 MiB. */
   maxRequestBodyBytes?: number
+  /** Proxy-signed user identity policy. Omit for legacy local-only deployments. */
+  principal?: RequestPrincipalConfig
 }
 
 export const Config: z<ConnectionConfig> = z.object({
@@ -92,6 +107,10 @@ export const Config: z<ConnectionConfig> = z.object({
   trustedHosts: z.array(String).default([]),
   cookieMaxAgeDays: z.natural().min(1).default(30),
   maxRequestBodyBytes: z.natural().min(1).default(DEFAULT_MAX_REQUEST_BODY_BYTES),
+  principal: z.object({
+    secret: z.string().default(''),
+    maxAgeMs: z.natural().min(1).default(60_000),
+  }).default({ secret: '', maxAgeMs: 60_000 }),
 })
 
 /**
@@ -111,10 +130,12 @@ export async function apply(ctx: Context, config?: ConnectionConfig): Promise<vo
   // silently authorizing its hostname prefix at request time.
   for (const entry of trustedHosts) assertTrustedAuthority(entry)
   assertImageBodyCapacity(ctx, maxRequestBodyBytes)
+  const requestPrincipal = new RequestPrincipalService(ctx, config?.principal)
   const connection = new HostConnectionService(
     ctx,
     trustedHosts,
     await BrowserAuth.create(ctx.root, ctx.credentials, cookieMaxAgeDays),
+    requestPrincipal,
   )
   ctx.inject(['webServer'], (webCtx) => {
     assertImageBodyCapacity(webCtx, maxRequestBodyBytes)
@@ -126,7 +147,7 @@ export async function apply(ctx: Context, config?: ConnectionConfig): Promise<vo
       kind: 'prefix',
       path: API_PATH,
       handler: async (req, res) => {
-        const rejection = connection.requestRejection(req)
+        const rejection = connection.requestRejection(nodeTrustRequest(req))
         if (rejection !== undefined) {
           res.writeHead(rejection)
           res.end(rejection === 401 ? 'unauthorized' : 'forbidden')

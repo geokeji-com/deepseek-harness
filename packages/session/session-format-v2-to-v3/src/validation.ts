@@ -77,12 +77,14 @@ export function restoreReleasedV3Artifact(artifact: SessionFormatArtifact, known
 /**
  * Refuse required predecessor PTC tags without interpreting native extension payloads.
  * @param event - event envelope whose type and ignorable admission markers are available.
+ * @param formatVersion - physical format version named by admission errors.
  */
-export function assertV3EventAdmission(event: SessionFormatEvent): void {
+export function assertV3EventAdmission(event: SessionFormatEvent, formatVersion = 3): void {
   if ((event.type === 'tool/code-dispatch-start' || event.type === 'tool/code-dispatch')
     && event['ignorable'] !== true) {
     throw new SessionFormatUnsupportedMigrationError(
-      'format v3 contains unknown event type ' + JSON.stringify(event.type) + ' at seq ' + String(event.seq),
+      'format v' + String(formatVersion) + ' contains unknown event type '
+        + JSON.stringify(event.type) + ' at seq ' + String(event.seq),
     )
   }
 }

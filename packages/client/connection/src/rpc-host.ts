@@ -12,6 +12,7 @@ import { bridge } from './http-bridge.ts'
 import { isTrustedApiRequest } from './api-request-trust.ts'
 import { API_PATH } from './api-path.ts'
 import type { BrowserAuth } from './browser-auth.ts'
+import { RequestPrincipalService, type RequestPrincipal } from './principal.ts'
 import type {
   ConnectionIndexRequest,
   ConnectionIndexResponse,
@@ -71,9 +72,13 @@ export class HostConnectionService extends Service implements HostConnectionHand
     ctx: Context,
     private readonly trustedHosts: readonly string[],
     private readonly browserAuth: BrowserAuth,
+    requestPrincipalService?: RequestPrincipalService,
   ) {
     super(ctx, 'connection')
+    this.requestPrincipalService = requestPrincipalService ?? new RequestPrincipalService(ctx)
   }
+
+  private readonly requestPrincipalService: RequestPrincipalService
 
   /** Generic channel registry scoped to the Context reading this service. */
   get rpc(): HostConnectionRpc {
@@ -96,7 +101,15 @@ export class HostConnectionService extends Service implements HostConnectionHand
   /** Apply the configured Host/Origin fence, then browser authentication. */
   requestRejection(request: ConnectionTrustRequest): ConnectionRequestRejection {
     if (!isTrustedApiRequest(request, this.trustedHosts)) return 403
+    if (this.requestPrincipalService.required && !isLoopback(request.remoteAddress)) return 403
+    if (this.requestPrincipalService.required
+      && this.requestPrincipalService.resolve(request) === undefined) return 401
     return this.browserAuth.isAuthenticated(request) ? undefined : 401
+  }
+
+  /** Verify the deployment principal carried by one request. */
+  requestPrincipal(request: ConnectionTrustRequest): RequestPrincipal | undefined {
+    return this.requestPrincipalService.resolve(request)
   }
 
   /** Authenticate an index request through the process-token exchange or cookie. */
@@ -125,7 +138,15 @@ export class HostConnectionService extends Service implements HostConnectionHand
       fetch: (request) => {
         const pathname = new URL(request.url).pathname
         const route = this.fetchRoutes.get(pathname)
-        if (route?.methods.has(request.method) === true) return route.fetch(request)
+        if (route?.methods.has(request.method) === true) {
+          const principal = this.requestPrincipalService.resolve(request) ?? this.requestPrincipalService.current()
+          if (this.requestPrincipalService.required && principal === undefined) {
+            return Promise.resolve(new Response('unauthorized', { status: 401 }))
+          }
+          return principal === undefined
+            ? route.fetch(request)
+            : this.requestPrincipalService.run(principal, () => route.fetch(request, principal))
+        }
         const endpoint = endpointFromPath(channel, pathname)
         const interceptor = this.interceptors.get(channel)
         if (endpoint === undefined || interceptor === undefined || !interceptor.matches(endpoint)) {
@@ -161,12 +182,12 @@ export class HostConnectionService extends Service implements HostConnectionHand
     handler: ConnectionRpcHandler,
   ): () => Promise<void> {
     assertChannel(channel)
-    const fetchHandler = rpcFetchHandler(channel, handler)
+    const fetchHandler = rpcFetchHandler(channel, handler, this.requestPrincipalService)
     const route: WebRoute = {
       kind: 'prefix',
       path: channel,
       handler: async (req, res) => {
-        const rejection = this.requestRejection(req)
+        const rejection = this.requestRejection(nodeTrustRequest(req))
         if (rejection !== undefined) {
           res.writeHead(rejection)
           res.end(rejection === 401 ? 'unauthorized' : 'forbidden')
@@ -192,7 +213,7 @@ export class HostConnectionService extends Service implements HostConnectionHand
     }
     const interceptor: ConnectionRpcInterceptor = {
       matches,
-      fetchHandler: rpcFetchHandler(channel, handler),
+      fetchHandler: rpcFetchHandler(channel, handler, this.requestPrincipalService),
     }
     return owner.effect(() => {
       if (this.interceptors.has(channel)) {
@@ -209,10 +230,15 @@ export class HostConnectionService extends Service implements HostConnectionHand
 function rpcFetchHandler(
   channel: string,
   handler: ConnectionRpcHandler,
+  principals: RequestPrincipalService,
 ): ConnectionFetchHandler {
   return {
     requestBodyMode: () => 'buffered',
     async fetch(request: Request): Promise<Response> {
+      const principal = principals.resolve(request)
+      if (principals.required && principal === undefined) {
+        return new Response('unauthorized', { status: 401 })
+      }
       const endpoint = endpointFromPath(channel, new URL(request.url).pathname)
       if (request.method !== 'POST' || endpoint === undefined) {
         return new Response('not found', { status: 404 })
@@ -244,13 +270,42 @@ function rpcFetchHandler(
       }
 
       try {
-        const result = await handler(endpoint, message.payload, request.signal)
+        const result = principal === undefined
+          ? await handler(endpoint, message.payload, request.signal)
+          : await principals.run(principal, () => handler(
+            endpoint,
+            message.payload,
+            request.signal,
+            principal,
+          ))
         return fullResponse(message.rpcId, result)
       } catch (error) {
         return new Response(`handler failure: ${String(error)}`, { status: 500 })
       }
     },
   }
+}
+
+export function nodeTrustRequest(request: {
+  readonly headers: ConnectionTrustRequest['headers']
+  readonly socket?: { readonly remoteAddress?: string | undefined }
+  readonly method?: string | undefined
+  readonly url?: string | undefined
+}): ConnectionTrustRequest {
+  return {
+    headers: request.headers,
+    ...request.socket?.remoteAddress === undefined
+      ? {}
+      : { remoteAddress: request.socket.remoteAddress },
+    ...request.method === undefined ? {} : { method: request.method },
+    ...request.url === undefined ? {} : { url: request.url },
+  }
+}
+
+function isLoopback(remoteAddress: string | undefined): boolean {
+  return remoteAddress === '127.0.0.1'
+    || remoteAddress === '::1'
+    || remoteAddress === '::ffff:127.0.0.1'
 }
 
 function invalidEnvelopeResponse(body: unknown, issues: readonly object[]): Response {

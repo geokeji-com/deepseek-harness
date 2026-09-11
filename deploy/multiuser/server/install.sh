@@ -18,6 +18,16 @@ PROJECT_SHARED_ROOT="$HOME/shared"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 BACKUP_ROOT="$HOME/.local/state/deepseek-harness/deployment-backups/$STAMP"
 OLD_HOME="$STATE_ROOT"
+BACKEND_MODE="${BACKEND_MODE:-shared}"
+SHARED_HOME="$SHARED_ROOT/home"
+SHARED_LOG_ROOT="$LOG_ROOT/shared"
+TEAM_WORKSPACE_ROOT="${TEAM_WORKSPACE_ROOT:-$SHARED_ROOT/workspace}"
+SHARED_HARNESS_PORT="${SHARED_HARNESS_PORT:-3094}"
+
+if [[ "$BACKEND_MODE" != "shared" && "$BACKEND_MODE" != "legacy" ]]; then
+  printf 'BACKEND_MODE must be "shared" or "legacy"\n' >&2
+  exit 2
+fi
 
 log() {
   local event="$1" status="$2" reason="$3"
@@ -31,7 +41,8 @@ run_install() {
   log job_started running migrate_current_state
   mkdir -p "$MULTI_ROOT" "$MULTI_ROOT/instances" "$INSTANCE_ROOT" \
     "$SHARED_ROOT" "$PATCH_ROOT" "$SKILLS_ROOT" "$WORKSPACE_ROOT" "$PROJECT_SHARED_ROOT" \
-    "$LOG_ROOT/instances" "$BACKUP_ROOT"
+    "$LOG_ROOT/instances" "$SHARED_LOG_ROOT" "$SHARED_HOME" "$TEAM_WORKSPACE_ROOT" \
+    "$BACKUP_ROOT"
   chmod 700 "$MULTI_ROOT" "$BACKUP_ROOT"
 
   mkdir -p "$BACKUP_ROOT/config" "$BACKUP_ROOT/systemd"
@@ -39,6 +50,11 @@ run_install() {
   cp -a "$CONFIG_ROOT/auth-server.mjs" "$BACKUP_ROOT/config/" 2>/dev/null || true
   cp -a "$HOME/.config/systemd/user/deepseek-harness.service" "$BACKUP_ROOT/systemd/" 2>/dev/null || true
   cp -a "$HOME/.config/systemd/user/deepseek-harness-auth.service" "$BACKUP_ROOT/systemd/" 2>/dev/null || true
+  cp -a "$MULTI_ROOT/users.json" "$BACKUP_ROOT/config/" 2>/dev/null || true
+  cp -a "$MULTI_ROOT/instances" "$BACKUP_ROOT/config/" 2>/dev/null || true
+  cp -a "$INSTANCE_ROOT/owner/home/settings.yaml" "$BACKUP_ROOT/config/" 2>/dev/null || true
+  cp -a "$INSTANCE_ROOT/owner/home/.credentials.yaml" "$BACKUP_ROOT/config/" 2>/dev/null || true
+  cp -a "$INSTANCE_ROOT/owner/home/storages/workspace.json" "$BACKUP_ROOT/config/" 2>/dev/null || true
 
   systemctl --user stop deepseek-harness.service deepseek-harness-auth.service 2>/dev/null || true
 
@@ -65,6 +81,7 @@ run_install() {
     "$WORKSPACE_ROOT/member3" "$WORKSPACE_ROOT/member4" "$PROJECT_SHARED_ROOT/projects"
   chmod 700 "$WORKSPACE_ROOT" "$WORKSPACE_ROOT/owner" "$WORKSPACE_ROOT/member2" \
     "$WORKSPACE_ROOT/member3" "$WORKSPACE_ROOT/member4"
+  chmod 775 "$TEAM_WORKSPACE_ROOT"
 
   for user in owner member2 member3 member4; do
     local home="$INSTANCE_ROOT/$user/home"
@@ -103,7 +120,77 @@ install_multiuser() {
     fi
     node "$MULTI_ROOT/extract-key.mjs" "$owner_credentials" "$shared_env"
   fi
+  local principal_secret_file="$MULTI_ROOT/principal.secret"
+  if [[ ! -s "$principal_secret_file" ]]; then
+    umask 077
+    openssl rand -base64 48 | tr -d '\n' >"$principal_secret_file"
+  fi
+  local principal_secret
+  principal_secret="$(cat "$principal_secret_file")"
+  if ! grep -q '^REQUEST_PRINCIPAL_SECRET=' "$shared_env"; then
+    printf 'REQUEST_PRINCIPAL_SECRET=%s\n' "$principal_secret" >>"$shared_env"
+  fi
   chmod 600 "$shared_env"
+
+  mkdir -p "$SHARED_HOME" "$SHARED_LOG_ROOT" "$TEAM_WORKSPACE_ROOT"
+  for item in profiles:profiles skills:skills .agent-presets:agent-presets; do
+    local link="${item%%:*}"
+    local target="${item##*:}"
+    if [[ ! -e "$SHARED_HOME/$link" ]]; then
+      ln -s "$SHARED_ROOT/$target" "$SHARED_HOME/$link"
+    fi
+  done
+  for file in settings.yaml .credentials.yaml; do
+    if [[ ! -f "$SHARED_HOME/$file" && -f "$INSTANCE_ROOT/owner/home/$file" ]]; then
+      install -m 0600 "$INSTANCE_ROOT/owner/home/$file" "$SHARED_HOME/$file"
+    fi
+  done
+  if [[ ! -d "$SHARED_HOME/storages" && -d "$INSTANCE_ROOT/owner/home/storages" ]]; then
+    mkdir -p "$SHARED_HOME/storages"
+    rsync -a --exclude workspace.json \
+      "$INSTANCE_ROOT/owner/home/storages/" "$SHARED_HOME/storages/"
+  else
+    mkdir -p "$SHARED_HOME/storages"
+  fi
+
+  local workspace_migration_sources=()
+  for user in owner member2 member3 member4; do
+    local registry="$INSTANCE_ROOT/$user/home/storages/workspace.json"
+    if [[ -f "$registry" ]]; then
+      workspace_migration_sources+=(--source "$user=$registry")
+    fi
+  done
+  if ((${#workspace_migration_sources[@]} > 0)); then
+    node "$SOURCE_DIR/../tools/migrate-shared-workspaces.mjs" \
+      "${workspace_migration_sources[@]}" \
+      --legacy-root "$WORKSPACE_ROOT" \
+      --team-root "$TEAM_WORKSPACE_ROOT" \
+      --output "$SHARED_HOME/storages/workspace.json"
+  fi
+
+  local migration_sources=()
+  local migration_cwd_prefixes=()
+  for user in owner member2 member3 member4; do
+    local sessions="$INSTANCE_ROOT/$user/home/sessions"
+    if [[ -d "$sessions" ]]; then
+      migration_sources+=(--source "$user=$sessions")
+      migration_cwd_prefixes+=(
+        --cwd-prefix "$WORKSPACE_ROOT/$user=$TEAM_WORKSPACE_ROOT/$user"
+      )
+    fi
+  done
+  if ((${#migration_sources[@]} > 0)); then
+    node "$SOURCE_DIR/../tools/migrate-sessions-v4.mjs" \
+      "${migration_sources[@]}" \
+      "${migration_cwd_prefixes[@]}" \
+      --output "$SHARED_HOME/sessions"
+  fi
+
+  local shared_harness_env="$MULTI_ROOT/shared-harness.env"
+  printf 'DSH_HOME=%s\nDSH_PORT=%s\nDSH_WORKSPACE=%s\nDSH_REQUEST_PRINCIPAL_SECRET=%s\n' \
+    "$SHARED_HOME" "$SHARED_HARNESS_PORT" "$TEAM_WORKSPACE_ROOT" \
+    "$principal_secret" >"$shared_harness_env"
+  chmod 600 "$shared_harness_env"
 
   for item in owner:3090 member2:3091 member3:3092 member4:3093; do
     local user="${item%%:*}"
@@ -128,7 +215,9 @@ install_multiuser() {
     chmod 600 "$MULTI_ROOT/users.json" "$MULTI_ROOT/new-user-passwords.txt"
   fi
 
-  printf 'MANAGER_PROXY_PORT=3080\nAUTH_PORT=3081\nPUBLIC_HOST=8.130.99.203\nCOOKIE_DAYS=30\nIDLE_MINUTES=120\nSTART_TIMEOUT_SECONDS=45\nWORKSPACE_ROOT=%s\nSHARED_PROJECTS_ROOT=%s\nSHARED_SKILLS_ROOT=%s\nSHARED_PROFILES_ROOT=%s\nSHARED_PRESETS_ROOT=%s\nINSTANCE_ROOT=%s\nAUTH_COOKIE_SECRET=%s\nUSERS_FILE=%s\n' \
+  printf 'BACKEND_MODE=%s\nMANAGER_PROXY_PORT=3080\nAUTH_PORT=3081\nPUBLIC_HOST=8.130.99.203\nCOOKIE_DAYS=30\nIDLE_MINUTES=120\nSTART_TIMEOUT_SECONDS=45\nREQUEST_PRINCIPAL_SECRET=%s\nSHARED_DSH_HOME=%s\nSHARED_HARNESS_PORT=%s\nSHARED_HARNESS_SERVICE=dsh-shared-harness.service\nSHARED_HARNESS_LOG=%s\nTEAM_WORKSPACE_ROOT=%s\nTEAM_WORKSPACE_PER_USER=true\nWORKSPACE_ROOT=%s\nSHARED_PROJECTS_ROOT=%s\nSHARED_SKILLS_ROOT=%s\nSHARED_PROFILES_ROOT=%s\nSHARED_PRESETS_ROOT=%s\nINSTANCE_ROOT=%s\nAUTH_COOKIE_SECRET=%s\nUSERS_FILE=%s\n' \
+    "$BACKEND_MODE" "$principal_secret" "$SHARED_HOME" "$SHARED_HARNESS_PORT" \
+    "$SHARED_LOG_ROOT/web.log" "$TEAM_WORKSPACE_ROOT" \
     "$WORKSPACE_ROOT" "$PROJECT_SHARED_ROOT/projects" "$SKILLS_ROOT" \
     "$SHARED_ROOT/profiles" "$SHARED_ROOT/agent-presets" "$INSTANCE_ROOT" \
     "$AUTH_COOKIE_SECRET" "$MULTI_ROOT/users.json" >"$MULTI_ROOT/multiuser.env"
@@ -138,6 +227,11 @@ install_multiuser() {
     "$HOME/.config/systemd/user/dsh-multiuser.service"
   cp "$SOURCE_DIR/deepseek-harness-user@.service" \
     "$HOME/.config/systemd/user/deepseek-harness-user@.service"
+  cp "$SOURCE_DIR/dsh-shared-harness.service" \
+    "$HOME/.config/systemd/user/dsh-shared-harness.service"
+  install -d -m 0700 "$HOME/.config/systemd/user/dsh-shared-harness.service.d"
+  install -m 0644 "$SOURCE_DIR/dsh-shared-harness.resource.conf" \
+    "$HOME/.config/systemd/user/dsh-shared-harness.service.d/resource.conf"
   mkdir -p "$HOME/bin"
   install -m 0755 "$SOURCE_DIR/deepseek-harness-update" \
     "$HOME/bin/deepseek-harness-update"
@@ -147,8 +241,24 @@ install_multiuser() {
     "$HOME/bin/dsh-skills-sync"
   install -m 0755 "$SOURCE_DIR/../tools/migrate-workspace.mjs" \
     "$HOME/bin/dsh-migrate-workspace"
+  local migration_repo_root
+  migration_repo_root="$(cd "$SOURCE_DIR/../../.." && pwd)"
+  for tool in sessions-v4 shared-workspaces; do
+    local wrapper="$HOME/bin/dsh-migrate-$tool"
+    printf '#!/usr/bin/env bash\nset -euo pipefail\nexport DSH_REPO_ROOT=%q\nexec node %q "$@"\n' \
+      "$migration_repo_root" \
+      "$migration_repo_root/deploy/multiuser/tools/migrate-$tool.mjs" >"$wrapper"
+    chmod 0755 "$wrapper"
+  done
   systemctl --user daemon-reload
+  systemctl --user disable --now 'deepseek-harness-user@*.service' >/dev/null 2>&1 || true
   systemctl --user enable dsh-multiuser.service >/dev/null
+  if [[ "$BACKEND_MODE" == "shared" ]]; then
+    systemctl --user enable dsh-shared-harness.service >/dev/null
+    systemctl --user restart dsh-shared-harness.service
+  else
+    systemctl --user disable --now dsh-shared-harness.service >/dev/null 2>&1 || true
+  fi
   systemctl --user restart dsh-multiuser.service
 
   local health=""

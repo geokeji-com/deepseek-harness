@@ -320,3 +320,53 @@ test('allows members to read shared skills but denies all write paths', async ()
     await rm(f.root, { recursive: true, force: true })
   }
 })
+
+test('keeps one shared harness while defaulting each member to a private workspace', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-path-policy-shared-'))
+  const workspaceRoot = join(root, 'workspace')
+  const sharedRoot = join(root, 'shared/projects')
+  const policy = createPathPolicy({
+    workspaceRoot,
+    sharedRoot,
+    shared: true,
+    perUserWorkspace: true,
+  })
+  try {
+    const ownerPicker = { args: {} }
+    const memberPicker = { args: {} }
+    assert.equal(
+      (await policy.inspectPayload('owner', 'directoryPicker/list', ownerPicker)).allowed,
+      true,
+    )
+    assert.equal(
+      (await policy.inspectPayload('member2', 'directoryPicker/list', memberPicker)).allowed,
+      true,
+    )
+    assert.equal(ownerPicker.args.path, join(workspaceRoot, 'owner'))
+    assert.equal(memberPicker.args.path, join(workspaceRoot, 'member2'))
+
+    const ownerSession = { args: { request: {} } }
+    const memberSession = { args: { request: {} } }
+    assert.equal(
+      (await policy.inspectPayload('owner', 'session/create', ownerSession)).allowed,
+      true,
+    )
+    assert.equal(
+      (await policy.inspectPayload('member2', 'session/create', memberSession)).allowed,
+      true,
+    )
+    assert.equal(ownerSession.args.request.cwd, join(workspaceRoot, 'owner'))
+    assert.equal(memberSession.args.request.cwd, join(workspaceRoot, 'member2'))
+
+    assert.equal(
+      (await policy.authorize('member2', join(workspaceRoot, 'owner'))).allowed,
+      false,
+    )
+    assert.equal(
+      (await policy.authorize('owner', join(workspaceRoot, 'member2'))).allowed,
+      false,
+    )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

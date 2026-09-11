@@ -5,6 +5,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-file-reference'
 import type { FileReferenceCandidate } from '@deepseek-ai/dsh-file-reference/types'
 import { Remote, TypertRemoteService } from '@deepseek-ai/dsh-typert-protocol'
+import { principalOwns, requestPrincipalOf, sessionNotFound } from './authorization.ts'
 
 declare module '@deepseek-ai/cordis' {
   interface Context {
@@ -35,6 +36,11 @@ export class SessionFileReferences extends TypertRemoteService {
     query: string,
     signal: AbortSignal,
   ): Promise<FileReferenceCandidate[]> {
+    const principal = requestPrincipalOf(this.ctx)
+    if (principal !== undefined
+      && !principalOwns(principal, agent.session.header.ownerUserId)) {
+      return Promise.reject(sessionNotFound(agent.id))
+    }
     return this.ctx.fileReferences.list(agent, query, signal)
   }
 }

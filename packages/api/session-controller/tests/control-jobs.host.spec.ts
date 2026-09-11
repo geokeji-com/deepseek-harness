@@ -1,6 +1,7 @@
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import type { Agent } from '@deepseek-ai/dsh-agent'
+import { RequestPrincipalService, toUserId } from '@deepseek-ai/dsh-client-connection'
 import type { JobOutcome } from '@deepseek-ai/dsh-jobs'
 import LocalJobRegistry from '@deepseek-ai/dsh-jobs-local'
 import SessionStore, { SESSION_FORMAT_VERSION, SessionId } from '@deepseek-ai/dsh-session'
@@ -29,7 +30,7 @@ function producer(label = 'sleep 60') {
   return { spec, reads, settle: (outcome: JobOutcome) => { settle(outcome) } }
 }
 
-async function harness(withJobs: boolean): Promise<{
+async function harness(withJobs: boolean, ownerUserId?: string): Promise<{
   ctx: Context
   session: Session
   agent: Agent
@@ -43,7 +44,9 @@ async function harness(withJobs: boolean): Promise<{
     await ctx.plugin(LocalJobRegistry)
     ctx.jobs.attachController('session-controller-test')
   }
-  const session = ctx.sessions.create()
+  const session = ctx.sessions.create(undefined, {
+    ...ownerUserId === undefined ? {} : { meta: { ownerUserId } },
+  })
   const agent: Agent = {
     id: session.id,
     options: {},
@@ -90,6 +93,34 @@ async function collectJobs(
 }
 
 describe('Session control jobs baseline', () => {
+  it('filters Session-scoped queue and job state to the signed owner', async () => {
+    const { ctx, session, agent, control } = await harness(false, 'member-a')
+    const foreign = ctx.sessions.create(SessionId('foreign-control'), {
+      meta: { ownerUserId: 'member-b' },
+    })
+    const principals = new RequestPrincipalService(ctx, {
+      secret: 'control-owner-isolation-secret-0123456789',
+    })
+    const abort = new AbortController()
+    const iterator = principals.bindIterable(
+      {
+        userId: toUserId('member-a'),
+        issuedAt: 1,
+        expiresAt: Number.MAX_SAFE_INTEGER,
+      },
+      control.control(abort.signal),
+    )[Symbol.asyncIterator]()
+
+    const first = await iterator.next()
+    if (first.done || first.value.type !== 'baseline') throw new Error('missing control baseline')
+    expect(first.value.value.queues[session.id]).toBeInstanceOf(Array)
+    expect(first.value.value.queues).not.toHaveProperty(foreign.id)
+    expect(agent.id).toBe(session.id)
+
+    abort.abort()
+    await iterator.next()
+  })
+
   it('represents an attached session with no jobs as an empty set', async () => {
     const { session, control } = await harness(true)
     const frame = await baseline(control)

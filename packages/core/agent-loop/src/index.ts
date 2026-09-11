@@ -33,6 +33,7 @@ import type { ProjectionDefinition } from '@deepseek-ai/dsh-session-projection'
 import { SessionPersistenceNotFoundError } from '@deepseek-ai/dsh-session-persistence'
 import type { SessionHandle, SessionPersistence } from '@deepseek-ai/dsh-session-persistence'
 import { ReactLoopAgent } from './agent.ts'
+import { TurnAdmissionController } from './turn-admission.ts'
 import { DEFAULT_MAX_PARALLEL_TOOL_CALLS } from './constants.ts'
 
 /** Fiber states that cannot own or serve a new lifecycle. */
@@ -377,6 +378,8 @@ export class AgentLoop extends Service implements AgentFactory {
   /** Validated configuration owned by the agent-loop service. */
   readonly config: ResolvedConfig
   private readonly ownership: FactoryOwnership
+  private readonly turnAdmission = new TurnAdmissionController()
+  private readonly metricsTimer: ReturnType<typeof setInterval>
   /** Plain holder prevents Cordis from re-tracing the factory's dependency context through a caller shadow. */
   private readonly runtime: { ctx: Context }
 
@@ -418,6 +421,21 @@ export class AgentLoop extends Service implements AgentFactory {
     this.runtime = { ctx }
     ctx.effect(() => () => this.ownership.dispose(), 'agentLoop.transactions()')
     ctx.effect(() => ctx.agents.setFactory(this), 'agentLoop.setFactory()')
+    this.metricsTimer = setInterval(() => {
+      const pool = ctx.agents.poolMetrics()
+      const turns = this.turnAdmission.metrics()
+      ctx.logger.info(`agent-loop: occupancy ${JSON.stringify({
+        resident: pool.resident,
+        running: pool.running,
+        idle: pool.idle,
+        evicted: pool.evicted,
+        turnRunning: turns.running,
+        queued: turns.queued,
+        waitingMs: turns.waitingMs,
+      })}`)
+    }, 60_000)
+    this.metricsTimer.unref()
+    ctx.effect(() => () => { clearInterval(this.metricsTimer) }, 'agentLoop.metrics()')
     ctx.systemPrompt.variable('provider', context => context.agent?.options.provider)
     ctx.systemPrompt.variable('model', context => context.agent?.options.model)
     ctx.systemPrompt.variable('cwd', context => context.agent?.session.header.cwd)
@@ -620,8 +638,9 @@ export class AgentLoop extends Service implements AgentFactory {
     const untrack = this.ownership.track(dispose)
     let unfollowOwner: () => Promise<void> | void
     try {
+      const turnAdmission = this.turnAdmission
       unfollowOwner = ownerCtx.effect(function* () {
-        machine = new ReactLoopAgent(loopCtx, id, options, session)
+        machine = new ReactLoopAgent(loopCtx, id, options, session, turnAdmission)
         machineReady.resolve()
         yield machine.scope.rawDispose
         yield () => {
@@ -664,7 +683,7 @@ export class AgentLoop extends Service implements AgentFactory {
           detachSession = agent.ctx.sessions.enter(session)
           // The mounted backend routes announced live events into the active
           // write handle by session id; the loop only owns the handle itself.
-          detachAgent = loopCtx.agents.enter(agent, parentAgent)
+          detachAgent = loopCtx.agents.enter(agent, parentAgent, dispose)
           agent.ctx.sessions.announce(session)
           assertLive()
           loopCtx.agents.announce(agent)

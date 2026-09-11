@@ -86,10 +86,15 @@ export function createPathPolicy(options = {}) {
   const profilesRoot = resolve(options.profilesRoot ?? DEFAULT_PROFILES_ROOT)
   const presetsRoot = resolve(options.presetsRoot ?? DEFAULT_PRESETS_ROOT)
   const legacyRoots = options.legacyRoots ?? {}
+  const shared = options.shared === true
+  const perUserWorkspace = options.perUserWorkspace === true
+  const sharedHome = resolve(options.sharedHome ?? '/home/dsh/.local/share/deepseek-harness/shared/home')
   const rootsCache = new Map()
   const readableRootsCache = new Map()
 
-  const primaryRoot = userId => resolve(workspaceRoot, userId)
+  const primaryRoot = userId => shared && !perUserWorkspace
+    ? workspaceRoot
+    : resolve(workspaceRoot, userId)
 
   async function rootsFor(userId) {
     const cached = rootsCache.get(userId)
@@ -136,7 +141,9 @@ export function createPathPolicy(options = {}) {
   async function workspacePath(userId, workspaceId) {
     if (typeof workspaceId !== 'string' || workspaceId.length === 0) return undefined
     try {
-      const file = resolve(instanceRoot, userId, 'home/storages/workspace.json')
+      const file = shared
+        ? resolve(sharedHome, 'storages/workspace.json')
+        : resolve(instanceRoot, userId, 'home/storages/workspace.json')
       const parsed = JSON.parse(await readFile(file, 'utf8'))
       return parsed?.tables?.workspaces?.[workspaceId]?.path
     } catch {
@@ -151,7 +158,9 @@ export function createPathPolicy(options = {}) {
       return undefined
     }
     try {
-      const file = resolve(instanceRoot, userId, SESSION_CACHE_DIR, `${sessionId}.json`)
+      const file = shared
+        ? resolve(sharedHome, SESSION_CACHE_DIR.replace(/^home\//u, ''), `${sessionId}.json`)
+        : resolve(instanceRoot, userId, SESSION_CACHE_DIR, `${sessionId}.json`)
       const parsed = JSON.parse(await readFile(file, 'utf8'))
       const cwd = parsed?.record?.identity?.cwd
       return typeof cwd === 'string' && cwd.startsWith('/') ? cwd : undefined

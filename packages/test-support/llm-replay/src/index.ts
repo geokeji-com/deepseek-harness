@@ -16,6 +16,7 @@ import { SESSION_FORMAT_VERSION, SessionLogOffset, type SessionEvent } from '@de
 import type { SessionLogOffset as SessionLogOffsetType } from '@deepseek-ai/dsh-session'
 import {
   SessionFormatUnsupportedMigrationError,
+  createOwnerAwareSessionFormatCatalog,
   sessionFormatCatalog,
 } from '@deepseek-ai/dsh-session-format-catalog'
 import type {
@@ -44,12 +45,14 @@ if (sessionFormatCatalog.currentVersion !== SESSION_FORMAT_VERSION) {
   )
 }
 
+const replaySessionFormatCatalog = createOwnerAwareSessionFormatCatalog('llm-replay')
+
 interface ParsedSessionFixture {
   readonly id: string
   readonly createdAt: number
   readonly inheritedEventCount: SessionLogOffsetType
   readonly events: SessionEvent[]
-  readonly artifact: ReturnType<ReturnType<typeof sessionFormatCatalog.createRestore>['finish']>
+  readonly artifact: ReturnType<ReturnType<typeof replaySessionFormatCatalog.createRestore>['finish']>
   readonly sourceHeader: Readonly<Record<string, unknown>>
 }
 
@@ -210,7 +213,7 @@ export function parseSessionLog(text: string): SessionEvent[] {
 function parseSessionFixture(text: string): ParsedSessionFixture {
   let headerLineNumber: number | undefined
   let sourceHeader: Record<string, unknown> | undefined
-  let restore: ReturnType<typeof sessionFormatCatalog.createRestore> | undefined
+  let restore: ReturnType<typeof replaySessionFormatCatalog.createRestore> | undefined
   const rowLines: number[] = []
   const eventLines: number[] = []
   let bodyKind: 'complete' | 'projected' | undefined
@@ -232,7 +235,7 @@ function parseSessionFixture(text: string): ParsedSessionFixture {
       headerLineNumber = lineNumber
       sourceHeader = recordValue
       try {
-        restore = sessionFormatCatalog.createRestore(normalizeProjectedHeader(recordValue), {
+        restore = replaySessionFormatCatalog.createRestore(normalizeProjectedHeader(recordValue), {
           recovery: 'strict',
           validation: 'current',
         })
@@ -330,11 +333,12 @@ function restoreProjectedRequestHeader(
 /** Encode one migrated fixture while retaining projected cwd and request-tool tokens. */
 function encodeCurrentSessionSnapshotFixture(text: string, parsed: ParsedSessionFixture): string {
   const header = {
-    ...sessionFormatCatalog.encodeCurrentHeader(
+    ...replaySessionFormatCatalog.encodeCurrentHeader(
       parsed.artifact.header,
       parsed.artifact.inheritedEventCount,
     ),
   }
+  if (!Object.hasOwn(parsed.sourceHeader, 'ownerUserId')) delete header['ownerUserId']
   const sourceCwd = parsed.sourceHeader['cwd']
   if (typeof sourceCwd === 'string' && /^\{\{cwd\}\}(?:\/|$)/.test(sourceCwd)) header['cwd'] = sourceCwd
   const sourceRequests = text.split(/\r?\n/).filter(line => line.trim().length > 0).slice(1)
@@ -344,7 +348,7 @@ function encodeCurrentSessionSnapshotFixture(text: string, parsed: ParsedSession
   const output = [
     JSON.stringify(header),
     ...parsed.artifact.events.map((event) => {
-      const encoded = sessionFormatCatalog.encodeCurrentEvent(event)
+      const encoded = replaySessionFormatCatalog.encodeCurrentEvent(event)
       if (event.type !== 'request/header') return JSON.stringify(encoded)
       const source = sourceRequests[requestIndex++] as Record<string, unknown>
       return JSON.stringify(restoreProjectedRequestHeader(encoded, source))

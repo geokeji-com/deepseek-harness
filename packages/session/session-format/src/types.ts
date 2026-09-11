@@ -16,6 +16,7 @@ export interface SessionFormatJsonObject {
 export interface SessionFormatHeader extends SessionFormatJsonObject {
   readonly version: number
   readonly id: string
+  readonly ownerUserId?: string
   readonly createdAt: number
   readonly cwd?: string
   readonly parentSession?: string

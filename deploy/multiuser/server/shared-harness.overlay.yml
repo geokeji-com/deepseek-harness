@@ -1,0 +1,11 @@
+# Shared multiuser Harness runs behind an authenticated proxy, so the
+# loopback-only native OS chooser cannot know which principal is picking.
+# Pin the in-browser chooser; its initial list request is rewritten by the
+# proxy to the caller's private Workspace root.
+- id: directory-picker
+  disabled: true
+- insert:
+    - id: directory-picker-browse
+      name: '@deepseek-ai/dsh-host-directory-picker-browse'
+    - id: ui-directory-picker-browse
+      name: '@deepseek-ai/dsh-client-ui-directory-picker-browse'

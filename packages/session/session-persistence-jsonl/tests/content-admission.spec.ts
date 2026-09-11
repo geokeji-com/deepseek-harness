@@ -9,8 +9,8 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/
 import { tmpdir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { generationLogPath, scanLog, type JsonlCompression } from '../src/format.ts'
-import { compressZstdFrame, decompressZstdFrame, scanZstdFrames } from '../src/zstd.ts'
+import { generationLogPath, type JsonlCompression } from '../src/format.ts'
+import { compressZstdFrame } from '../src/zstd.ts'
 
 const id = SessionId('content-admission')
 const text = { type: 'text', text: 'Keep tool/code-dispatch and tools-code-mode literal. 图片' }
@@ -162,6 +162,17 @@ async function expectOnlyGenerations(paths: readonly string[]) {
     .toEqual(paths.map(path => basename(path)).sort())
 }
 
+async function expectUnsupported(promise: Promise<void>): Promise<SessionFormatUnsupportedError> {
+  try {
+    await promise
+  } catch (error) {
+    expect(error).toBeInstanceOf(SessionFormatUnsupportedError)
+    if (!(error instanceof SessionFormatUnsupportedError)) throw error
+    return error
+  }
+  throw new Error('expected SessionFormatUnsupportedError')
+}
+
 const modes = (['none', 'zstd'] as const).flatMap(compression =>
   (['read', 'write'] as const).map(access => ({ compression, access })),
 )
@@ -169,79 +180,33 @@ const modes = (['none', 'zstd'] as const).flatMap(compression =>
 describe.each(modes)('V2 content EOF refusal ($compression, $access)', ({ compression, access }) => {
   it.each(carriers)('refuses $name without source mutation or prefix publication', async (carrier) => {
     const rows = carrier.rows(unknown)
-    const tail = rows.at(-1)!
     const path = await store(compression, rows)
     const original = await observe(path)
     const ctx = await mount(compression)
     const opened = ctx.sessionPersistence.open(id, access).then(async (handle) => {
       try { await handle.read() } finally { await handle.close() }
     })
-    await expect(opened).rejects.toBeInstanceOf(SessionFormatUnsupportedError)
-    await expect(opened).rejects.toMatchObject({
-      message: 'format v2 ' + tail['type'] + ' at seq ' + String(rows.length - 1) + ' '
-        + carrier.path + ': cannot safely transform unclassified message content kind "future-block"'
-        + '; source v2 artifact remains unchanged (raw log: ' + path + ')',
-      location: { kind: 'jsonl', path },
-    })
+    const refusal = await expectUnsupported(opened)
+    expect(refusal.message).toContain('owner-aware migration tool')
+    expect(refusal.location).toEqual({ kind: 'jsonl', path })
     expect(await observe(path)).toEqual(original)
     await expectOnlyGenerations([path])
   })
 })
 
-describe.each(['none', 'zstd'] as const)('V2 admitted content publication (%s)', (compression) => {
-  it.each(carriers)('preserves $name on read, publication, and fresh reopen', async (carrier) => {
+describe.each(['none', 'zstd'] as const)('V2 admitted content refusal (%s)', (compression) => {
+  it.each(carriers)('refuses $name instead of publishing without an owner', async (carrier) => {
     const rows = carrier.rows(text)
-    const tail = rows.at(-1)!
     const path = await store(compression, rows)
     const original = await observe(path)
     const ctx = await mount(compression)
-    const reader = await ctx.sessionPersistence.open(id, 'read')
-    const restored = await (async () => {
-      try {
-        expect(reader.header.version).toBe(3)
-        return await reader.read()
-      } finally { await reader.close() }
-    })()
-    expect(restored.events.map(event => event.type)).toEqual([
-      'turn/start', 'step/start', 'system/message',
-      ...rows.slice(2).map(row => row['type'] === 'tool/code-dispatch-start' ? 'tool/ptc-dispatch-start'
-        : row['type'] === 'tool/code-dispatch' ? 'tool/ptc-dispatch' : row['type']),
-    ])
-    expect(restored.events.at(-1)).toMatchObject({
-      type: carrier.targetType ?? tail['type'], seq: rows.length,
+    const opened = ctx.sessionPersistence.open(id, 'read').then(async (handle) => {
+      try { await handle.read() } finally { await handle.close() }
     })
-    expect(restored.events.at(-1)?.data).toEqual(carrier.targetData ?? tail['data'])
+    const refusal = await expectUnsupported(opened)
+    expect(refusal.message).toContain('owner-aware migration tool')
+    expect(refusal.location).toEqual({ kind: 'jsonl', path })
     expect(await observe(path)).toEqual(original)
     await expectOnlyGenerations([path])
-
-    const writer = await ctx.sessionPersistence.open(id, 'write')
-    try {
-      expect((await writer.read()).events).toEqual(restored.events)
-      await writer.flush()
-    } finally { await writer.close() }
-    const successor = generationLogPath(root!, undefined, id, 3, compression)
-    const published = await readFile(successor)
-    let decoded = published
-    if (compression === 'zstd') {
-      const { frames, tornStart } = scanZstdFrames(published)
-      expect(tornStart).toBeUndefined()
-      decoded = Buffer.concat(await Promise.all(frames.map(frame =>
-        decompressZstdFrame(published.subarray(frame.start, frame.end)),
-      )))
-    }
-    expect(scanLog(decoded).events).toEqual(restored.events)
-    expect(await observe(path)).toEqual(original)
-    await expectOnlyGenerations([path, successor])
-
-    await ctx.fiber.dispose()
-    const fresh = await mount(compression)
-    const reopened = await fresh.sessionPersistence.open(id, 'read')
-    try {
-      expect(reopened.header.version).toBe(3)
-      expect((await reopened.read()).events).toEqual(restored.events)
-    } finally { await reopened.close() }
-    expect(await observe(path)).toEqual(original)
-    expect(await readFile(successor)).toEqual(published)
-    await expectOnlyGenerations([path, successor])
   })
 })

@@ -24,6 +24,8 @@ export interface TypertRemoteEventFrame {
   readonly event: string
   /** Original event argument list after the owner validates it for JSON transport. */
   readonly args: readonly unknown[]
+  /** Durable user owner when the event is scoped to one Session. */
+  readonly ownerUserId?: string
 }
 
 /** Live Host values used to project one scoped Remote Event. */
@@ -34,6 +36,8 @@ export interface TypertRemoteEventContext {
   readonly subject: object
   /** Agent identity read directly from the scoped event subject. */
   readonly agentId: string
+  /** Durable user owner inherited from the scoped Agent's Session. */
+  readonly ownerUserId?: string
 }
 
 /** Result returned from a Client waterfall, or delegation back to the Host chain. */

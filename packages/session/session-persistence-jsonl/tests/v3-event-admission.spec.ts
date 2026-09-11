@@ -8,8 +8,11 @@ import { dirname, join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { generationLogPath, scanLog } from '../src/format.ts'
 
-const id = SessionId('v3-admission')
-const header = { type: 'session', version: 3, id, createdAt: 1000, isSeeded: false, delegationDepth: 0 }
+const id = SessionId('v4-admission')
+const header = {
+  type: 'session', version: 4, id, ownerUserId: 'v4-admission-owner',
+  createdAt: 1000, isSeeded: false, delegationDepth: 0,
+}
 const start = { type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } }
 const prefix = [header, start].map(row => JSON.stringify(row)).join('\n') + '\n'
 const obsoleteTypes = ['tool/code-dispatch-start', 'tool/code-dispatch'] as const
@@ -22,7 +25,7 @@ function obsoleteEvent(type: string, ignorable?: true) {
   }
 }
 
-describe('native V3 event admission at EOF', () => {
+describe('native V4 event admission at EOF', () => {
   let root: string
   let ctx: Context
 
@@ -41,7 +44,7 @@ describe('native V3 event admission at EOF', () => {
   })
 
   async function store(bytes: Buffer): Promise<string> {
-    const path = generationLogPath(root, undefined, id, 3, 'none')
+    const path = generationLogPath(root, undefined, id, 4, 'none')
     await mkdir(dirname(path), { recursive: true })
     await writeFile(path, bytes)
     return path
@@ -72,14 +75,14 @@ describe('native V3 event admission at EOF', () => {
   it.each(obsoleteTypes)('scanLog refuses a complete required %s EOF row', (type) => {
     const bytes = Buffer.from(prefix + JSON.stringify(obsoleteEvent(type)) + '\n')
     expect(() => scanLog(bytes)).toThrow(SessionFormatUnsupportedError)
-    expect(() => scanLog(bytes)).toThrow('format v3 contains unknown event type')
+    expect(() => scanLog(bytes)).toThrow('format v4 contains unknown event type')
   })
 
   it.each(obsoleteTypes.flatMap(type => ['', '{not json\n', 'null\n'].map(corruption => ({ type, corruption }))))(
     'scan, read and write refuse required $type after "$corruption" without changing bytes or inode', async ({ type, corruption }) => {
       const bytes = Buffer.from(prefix + corruption + JSON.stringify(obsoleteEvent(type)) + '\n')
       expect(() => scanLog(bytes)).toThrow(SessionFormatUnsupportedError)
-      expect(() => scanLog(bytes)).toThrow('format v3 contains unknown event type')
+      expect(() => scanLog(bytes)).toThrow('format v4 contains unknown event type')
       const path = await store(bytes)
       const sourceStat = await stat(path)
       for (const access of ['read', 'write'] as const) {

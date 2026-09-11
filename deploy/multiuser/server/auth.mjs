@@ -32,6 +32,7 @@ export class UserAuth {
     }
     this.config = config
     this.secret = Buffer.from(config.cookieSecret, 'base64url')
+    this.cookieSecure = config.cookieSecure !== false
     this.failures = new Map()
   }
 
@@ -74,11 +75,13 @@ export class UserAuth {
 
   cookieHeader(userId, ip, now = Date.now()) {
     const maxAge = this.config.cookieDays * 24 * 60 * 60
-    return `${COOKIE_NAME}=${this.issue(userId, ip, now)}; Max-Age=${maxAge}; Path=/; HttpOnly; Secure; SameSite=Lax`
+    const secure = this.cookieSecure ? '; Secure' : ''
+    return `${COOKIE_NAME}=${this.issue(userId, ip, now)}; Max-Age=${maxAge}; Path=/; HttpOnly${secure}; SameSite=Lax`
   }
 
   clearCookieHeader() {
-    return `${COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Lax`
+    const secure = this.cookieSecure ? '; Secure' : ''
+    return `${COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly${secure}; SameSite=Lax`
   }
 
   parseCookie(header) {

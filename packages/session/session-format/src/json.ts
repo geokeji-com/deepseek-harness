@@ -87,6 +87,10 @@ export function snapshotSessionFormatHeader(header: SessionFormatHeader, label =
   if (!isSessionFormatJsonObject(snapshot)) throw new SessionFormatError(`${label} must be a JSON object`)
   inspectSessionFormatVersion(snapshot)
   if (typeof snapshot['id'] !== 'string') throw new SessionFormatError(`${label} id must be a string`)
+  if (snapshot['ownerUserId'] !== undefined
+    && (typeof snapshot['ownerUserId'] !== 'string' || snapshot['ownerUserId'].length === 0)) {
+    throw new SessionFormatError(`${label} ownerUserId must be a non-empty string`)
+  }
   sessionFormatCount(snapshot['createdAt'], `${label} createdAt`)
   if (typeof snapshot['isSeeded'] !== 'boolean') throw new SessionFormatError(`${label} isSeeded must be a boolean`)
   sessionFormatCount(snapshot['delegationDepth'], `${label} delegationDepth`)

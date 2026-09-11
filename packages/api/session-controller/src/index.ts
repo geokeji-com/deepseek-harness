@@ -24,6 +24,7 @@ import { buildModelCatalog } from './catalog.ts'
 import { installModelSelectionProjection } from './model-selection-projection.ts'
 import { SessionSkillCatalog } from './skill-catalog.ts'
 import { SessionMediaReferences } from './media-references.ts'
+import { principalOwns, requestPrincipalOf, sessionNotFound } from './authorization.ts'
 import type {
   ModelCatalog,
   SessionAttachmentRequest,
@@ -204,6 +205,9 @@ export class SessionController extends TypertRemoteService {
   ): Promise<SessionInspection> {
     const attached = this.ctx.sessions.get(sessionId)
     if (attached !== undefined) {
+      if (!principalOwns(requestPrincipalOf(this.ctx), attached.header.ownerUserId)) {
+        throw sessionNotFound(sessionId)
+      }
       return Promise.resolve({
         meta: attached.header,
         inheritedEventCount: attached.inheritedEventCount,
@@ -222,7 +226,7 @@ export class SessionController extends TypertRemoteService {
    */
   @Remote('list')
   async list(_request: SessionListRequest, signal: AbortSignal): Promise<SessionListValue> {
-    return { items: await this.listState.list(signal) }
+    return { items: await this.listState.list(signal, requestPrincipalOf(this.ctx)) }
   }
 
   /**
@@ -233,7 +237,7 @@ export class SessionController extends TypertRemoteService {
    */
   @Remote('search')
   search(request: SessionSearchRequest, signal: AbortSignal): Promise<SessionSearchValue> {
-    return this.listState.search(request.query, signal)
+    return this.listState.search(request.query, signal, requestPrincipalOf(this.ctx))
   }
 
   /**
@@ -346,7 +350,7 @@ export class SessionController extends TypertRemoteService {
   @Remote('prompt')
   prompt(request: SessionPromptRequest, signal: AbortSignal): Promise<SessionPromptValue> {
     signal.throwIfAborted()
-    return this.commands.prompt(request)
+    return this.commands.prompt(request, signal)
   }
 
   /**
@@ -365,8 +369,11 @@ export class SessionController extends TypertRemoteService {
    * @returns acknowledgement that the queue mutation was applied.
    */
   @Remote('updateQueue')
-  updateQueue(request: SessionUpdateQueueRequest): SessionUpdateQueueValue {
-    return this.commands.updateQueue(request)
+  async updateQueue(
+    request: SessionUpdateQueueRequest,
+    signal?: AbortSignal,
+  ): Promise<SessionUpdateQueueValue> {
+    return this.commands.updateQueue(request, signal)
   }
 
   /**

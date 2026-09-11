@@ -37,6 +37,7 @@ import { RuntimeContextProjection } from './runtime-context.ts'
 import { AssistantStreamAttempt } from './assistant-stream.ts'
 import { SystemPromptProjection } from './runtime-context.ts'
 import { executeToolCalls } from './tool-calls.ts'
+import { TurnAdmissionController } from './turn-admission.ts'
 
 type Phase =
   | { kind: 'idle'; lastTurn: number }
@@ -98,6 +99,7 @@ export class ReactLoopAgent implements Agent {
     public readonly id: SessionId,
     public readonly options: AgentOptions,
     public readonly session: Session,
+    private readonly turnAdmission = new TurnAdmissionController(),
   ) {
     this.requestSurfaceGeneration = session.surface.replaceGeneration
     this.dispatch = agentEvents(loopCtx, this)
@@ -125,25 +127,43 @@ export class ReactLoopAgent implements Agent {
     }
   }
 
-  send(message: UserMessage, target: InboxTarget, wakeup: boolean): void {
+  send(
+    message: UserMessage,
+    target: InboxTarget,
+    wakeup: boolean,
+    signal?: AbortSignal,
+  ): void | Promise<void> {
     // Waking input cannot join an aborted activity, so it starts the next turn.
     // Captured before the insertion so a reentrant cancel from a splice observer cannot reclassify it.
     const wakingAfterAbort = wakeup && this.phase.kind !== 'idle' && this.phase.abort.signal.aborted
     const resolvedTarget = wakingAfterAbort ? 'next-turn' : target
     this.inbox.splice(resolvedTarget, Infinity, 0, [message])
-    if (wakeup) this.wakeDriver(wakingAfterAbort)
+    if (!wakeup) return
+    try {
+      const wake = this.wakeDriver(wakingAfterAbort, signal)
+      if (!(wake instanceof Promise)) return
+      const contained = wake.catch((error: unknown) => {
+        this.inbox.remove(message.id)
+        throw error
+      })
+      void contained.catch(() => {})
+      return contained
+    } catch (error: unknown) {
+      this.inbox.remove(message.id)
+      throw error
+    }
   }
 
-  followup(input: UserMessage): void {
-    this.send(input, 'next-turn', true)
+  followup(input: UserMessage, signal?: AbortSignal): void | Promise<void> {
+    return this.send(input, 'next-turn', true, signal)
   }
 
-  steer(input: UserMessage): void {
-    this.send(input, 'next-step', true)
+  steer(input: UserMessage, signal?: AbortSignal): void | Promise<void> {
+    return this.send(input, 'next-step', true, signal)
   }
 
   inject(input: UserMessage): void {
-    this.send(input, 'next-step', false)
+    void this.send(input, 'next-step', false)
   }
 
   cancel(cause: AgentCancelCause, options: CancelOptions = {}): void {
@@ -170,7 +190,7 @@ export class ReactLoopAgent implements Agent {
         return await job(maintenance.abort.signal)
       } finally {
         this.setPhase({ kind: 'idle', lastTurn: maintenance.lastTurn })
-        if (maintenance.wakeRequested && this.inbox.hasPending) this.wakeDriver()
+        if (maintenance.wakeRequested && this.inbox.hasPending) void this.wakeDriver()
         done.resolve()
       }
     })()
@@ -184,7 +204,7 @@ export class ReactLoopAgent implements Agent {
    * @param wakeAfterAbort - the {@link send} classification, captured before
    *   the inbox insertion so a reentrant cancel cannot reclassify it.
    */
-  private wakeDriver(wakeAfterAbort = false): void {
+  private wakeDriver(wakeAfterAbort = false, callerSignal?: AbortSignal): void | Promise<void> {
     if (this.phase.kind !== 'idle') {
       // Maintenance and aborted drivers cannot deliver the wake: latch it for
       // replay at convergence. Live drivers claim queued work themselves;
@@ -197,14 +217,41 @@ export class ReactLoopAgent implements Agent {
     }
     const driver = Promise.withResolvers<void>()
     this.activityDone = driver.promise
-    this.setPhase({
+    const runningPhase: Extract<Phase, { kind: 'running' }> = {
       kind: 'running',
       abort: new AbortController(),
       turn: this.phase.lastTurn,
       step: 0,
       wakeRequested: false,
-    })
-    this.loopCtx.agents.withInitiator(this, () => this.kick()).then(driver.resolve, driver.reject)
+    }
+    this.setPhase(runningPhase)
+    const signal = callerSignal === undefined
+      ? runningPhase.abort.signal
+      : AbortSignal.any([runningPhase.abort.signal, callerSignal])
+    const run = async (release: () => void): Promise<void> => {
+      try {
+        await this.loopCtx.agents.withInitiator(this, () => this.kick())
+      } finally {
+        release()
+      }
+    }
+    const immediate = this.turnAdmission.tryAcquire()
+    const admitted = immediate === undefined
+      ? this.turnAdmission.acquire(this.id, signal).then(run)
+      : run(immediate)
+    const result = admitted.then(
+      () => { driver.resolve() },
+      (error: unknown) => {
+        const current = this.phase
+        if (current.kind === 'running' && current.abort === runningPhase.abort) {
+          this.setPhase({ kind: 'idle', lastTurn: runningPhase.turn })
+        }
+        driver.resolve()
+        throw error
+      },
+    )
+    void result.catch(() => {})
+    return result
   }
 
   async whenIdle(): Promise<void> {
@@ -232,7 +279,7 @@ export class ReactLoopAgent implements Agent {
       if (this.phase.kind === 'running') {
         const { turn, wakeRequested } = this.phase
         this.setPhase({ kind: 'idle', lastTurn: turn })
-        if (wakeRequested && this.inbox.hasPending) this.wakeDriver()
+        if (wakeRequested && this.inbox.hasPending) void this.wakeDriver()
       }
     }
   }

@@ -212,14 +212,20 @@ declare module './types.ts' {
    * @param target - the preferred next-turn or next-step inbox boundary.
    * @param wakeup - whether delivery may wake the driver.
    */
-    send(message: UserMessage, target: InboxTarget, wakeup: boolean): void
+    send(
+      message: UserMessage,
+      target: InboxTarget,
+      wakeup: boolean,
+      signal?: AbortSignal,
+    ): void | Promise<void>
 
     /**
    * Queue an ordinary follow-up turn and wake the driver. The item becomes the
    * sole ordinary message of its own turn.
    * @param message - identified prompt content and the source that supplied it.
+   * @param signal - optional caller cancellation while waiting for a turn slot.
    */
-    followup(message: UserMessage): void
+    followup(message: UserMessage, signal?: AbortSignal): void | Promise<void>
 
     /**
    * Submit steering for the nearest step. An idle driver starts a turn;
@@ -227,8 +233,9 @@ declare module './types.ts' {
    * A rejected step leaves steering parked in the inbox until the next
    * wake; cancellation or disposal may discard pending steering.
    * @param message - identified steering content and the source that supplied it.
+   * @param signal - optional caller cancellation while waiting for a turn slot.
    */
-    steer(message: UserMessage): void
+    steer(message: UserMessage, signal?: AbortSignal): void | Promise<void>
 
     /**
    * Queue model-facing context for the next pre-step without waking the

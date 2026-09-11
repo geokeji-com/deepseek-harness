@@ -61,7 +61,7 @@ const COMPACTION_ID = CompactionId('replay-compaction')
 /** Build a minimal session-JSONL string: a header line + the given events. */
 function sessionJsonl(
   events: SessionEvent[],
-  header?: { id?: string; createdAt?: number; seedLength?: number; version?: 0 | 1 | 2 | 3 },
+  header?: { id?: string; createdAt?: number; seedLength?: number; version?: 0 | 1 | 2 | 3 | 4 },
 ): string {
   const version = header?.version ?? 0
   const headerLine = JSON.stringify({
@@ -79,7 +79,7 @@ function sessionJsonl(
 /** Build a valid one-turn Session around recorded model calls. */
 function replaySessionJsonl(
   calls: readonly StreamChunk[][],
-  header?: { id?: string; createdAt?: number; seedLength?: number; version?: 0 | 1 | 2 | 3 },
+  header?: { id?: string; createdAt?: number; seedLength?: number; version?: 0 | 1 | 2 | 3 | 4 },
 ): string {
   const version = header?.version ?? SESSION_FORMAT_VERSION
   const events: SessionEvent[] = []
@@ -240,13 +240,13 @@ describe('fixture format diagnostics', () => {
       const actual = await importOriginal<typeof import('@deepseek-ai/dsh-session-format-catalog')>()
       return {
         ...actual,
-        sessionFormatCatalog: {
+        createOwnerAwareSessionFormatCatalog: () => ({
           ...actual.sessionFormatCatalog,
           createRestore(): never {
             const failure: unknown = 'decoder exploded'
             throw failure
           },
-        },
+        }),
       }
     })
     try {
@@ -266,7 +266,7 @@ describe('fixture format diagnostics', () => {
       const actual = await importOriginal<typeof import('@deepseek-ai/dsh-session-format-catalog')>()
       return {
         ...actual,
-        sessionFormatCatalog: {
+        createOwnerAwareSessionFormatCatalog: () => ({
           ...actual.sessionFormatCatalog,
           createRestore() {
             return {
@@ -277,7 +277,7 @@ describe('fixture format diagnostics', () => {
               },
             }
           },
-        },
+        }),
       }
     })
     try {
@@ -297,7 +297,7 @@ describe('fixture format diagnostics', () => {
       const actual = await importOriginal<typeof import('@deepseek-ai/dsh-session-format-catalog')>()
       return {
         ...actual,
-        sessionFormatCatalog: {
+        createOwnerAwareSessionFormatCatalog: () => ({
           ...actual.sessionFormatCatalog,
           createRestore() {
             return {
@@ -308,7 +308,7 @@ describe('fixture format diagnostics', () => {
               },
             }
           },
-        },
+        }),
       }
     })
     try {
@@ -329,7 +329,7 @@ describe('fixture format diagnostics', () => {
       let row = 0
       return {
         ...actual,
-        sessionFormatCatalog: {
+        createOwnerAwareSessionFormatCatalog: () => ({
           ...actual.sessionFormatCatalog,
           createRestore() {
             return {
@@ -341,7 +341,7 @@ describe('fixture format diagnostics', () => {
               finish(): never { throw new Error('unexpected finish') },
             }
           },
-        },
+        }),
       }
     })
     try {
@@ -372,7 +372,7 @@ describe('fixture format diagnostics', () => {
       const actual = await importOriginal<typeof import('@deepseek-ai/dsh-session-format-catalog')>()
       return {
         ...actual,
-        sessionFormatCatalog: {
+        createOwnerAwareSessionFormatCatalog: () => ({
           ...actual.sessionFormatCatalog,
           createRestore() {
             return {
@@ -381,7 +381,7 @@ describe('fixture format diagnostics', () => {
               finish(): never { throw new Error(message) },
             }
           },
-        },
+        }),
       }
     })
     try {

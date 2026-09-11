@@ -2,7 +2,7 @@
 
 import { mkdir } from 'node:fs/promises'
 import type { Context } from '@deepseek-ai/cordis'
-import { installModelSelection } from '@deepseek-ai/dsh-agent'
+import { AgentPoolCapacityError, installModelSelection } from '@deepseek-ai/dsh-agent'
 import type {
   Agent, AgentOptions, AgentSetup, ModelSelection as AgentModelSelection, ModelSelectionRef,
 } from '@deepseek-ai/dsh-agent'
@@ -14,6 +14,7 @@ import type { SessionInspection } from '@deepseek-ai/dsh-session-persistence'
 import { SessionQueryError, type SessionObservation } from '@deepseek-ai/dsh-session-query'
 import { RemoteError } from '@deepseek-ai/dsh-typert-protocol'
 import type {} from '@deepseek-ai/dsh-typert-registry'
+import { principalOwns, requestOwnerOf, requestPrincipalOf } from './authorization.ts'
 import type { ModelSelection } from './types.ts'
 
 /** Cold Session identity absent from persistence. */
@@ -58,7 +59,9 @@ export class ApiSessionPresetConflict extends Error {
 }
 
 /** Failures produced while resolving one ordinary Session identity to its live Agent. */
-export type ApiSessionAgentError = RemoteError<'session/not-found' | 'session/agent-busy' | 'gateway/internal'>
+export type ApiSessionAgentError = RemoteError<
+  'session/not-found' | 'session/agent-busy' | 'gateway/overloaded' | 'gateway/internal'
+>
 
 /** Result of resolving one ordinary Session identity to its live Agent. */
 export type ApiSessionAgentResult =
@@ -119,6 +122,9 @@ export async function inspectApiSession(
       ...(signal === undefined ? {} : { signal }),
       projectionMode: 'none',
     })
+    if (!principalOwns(requestPrincipalOf(ctx), observation.header.ownerUserId)) {
+      throw new ApiSessionNotFound(`session "${sessionId}" not found`)
+    }
     if (observation.header.cwd === undefined) {
       throw new ApiSessionNotFound(`session "${sessionId}" not found`)
     }
@@ -187,8 +193,17 @@ export class ApiSessionAgentController {
     const live = this.liveAgent(sessionId)
     if (live !== undefined) return live
     const attached = this.ctx.sessions.get(sessionId)
-    if (attached !== undefined && hasApiSessionSubagentOwner(this.ctx, attached, undefined)) {
-      return { error: apiSessionSubagentOwnershipError(sessionId) }
+    if (attached !== undefined) {
+      if (!principalOwns(requestPrincipalOf(this.ctx), attached.header.ownerUserId)) {
+        return { error: new RemoteError('session/not-found', `session "${sessionId}" not found`, { sessionId }) }
+      }
+      if (hasApiSessionSubagentOwner(this.ctx, attached, undefined)) {
+        return { error: apiSessionSubagentOwnershipError(sessionId) }
+      }
+    }
+    if (observation !== undefined
+      && !principalOwns(requestPrincipalOf(this.ctx), observation.header.ownerUserId)) {
+      return { error: new RemoteError('session/not-found', `session "${sessionId}" not found`, { sessionId }) }
     }
 
     let resume = this.resumes.get(sessionId)
@@ -204,6 +219,14 @@ export class ApiSessionAgentController {
       }
       if (error instanceof ApiSessionSubagentOwnership) {
         return { error: apiSessionSubagentOwnershipError(error.sessionId) }
+      }
+      if (error instanceof AgentPoolCapacityError) {
+        return {
+          error: new RemoteError('gateway/overloaded', error.message, {
+            reason: 'agent-pool',
+            retryAfterMs: error.retryAfterMs,
+          }),
+        }
       }
       const raced = this.liveAgent(sessionId)
       if (raced !== undefined) return raced
@@ -256,6 +279,9 @@ export class ApiSessionAgentController {
       this.creations.set(sessionId, creation)
     }
     const agent = await creation
+    if (!principalOwns(requestPrincipalOf(this.ctx), agent.session.header.ownerUserId)) {
+      throw new ApiSessionNotFound(`session "${sessionId}" not found`)
+    }
     if (hasApiSessionSubagentOwner(this.ctx, agent.session, agent)) {
       throw new ApiSessionSubagentOwnership(sessionId)
     }
@@ -392,6 +418,9 @@ export class ApiSessionAgentController {
   private liveAgent(sessionId: SessionId): ApiSessionAgentResult | undefined {
     const agent = this.ctx.agents.get(sessionId)
     if (agent === undefined) return undefined
+    if (!principalOwns(requestPrincipalOf(this.ctx), agent.session.header.ownerUserId)) {
+      return { error: new RemoteError('session/not-found', `session "${sessionId}" not found`, { sessionId }) }
+    }
     return hasApiSessionSubagentOwner(this.ctx, agent.session, agent)
       ? { error: apiSessionSubagentOwnershipError(sessionId) }
       : { agent }
@@ -415,6 +444,9 @@ export class ApiSessionAgentController {
     sessionId: SessionId,
     observation: SessionObservation,
   ): Promise<Agent> {
+    if (!principalOwns(requestPrincipalOf(this.ctx), observation.header.ownerUserId)) {
+      throw new ApiSessionNotFound(`session "${sessionId}" not found`)
+    }
     if (observation.header.id !== sessionId || observation.header.cwd === undefined) {
       throw new ApiSessionNotFound(`session "${sessionId}" not found`)
     }
@@ -442,6 +474,16 @@ export class ApiSessionAgentController {
   ): Promise<Agent> {
     const attached = this.ctx.sessions.get(sessionId)
     const live = this.ctx.agents.get(sessionId)
+    const ownerUserId = requestOwnerOf(this.ctx)
+    if (live !== undefined) {
+      if (!principalOwns(requestPrincipalOf(this.ctx), live.session.header.ownerUserId)) {
+        throw new ApiSessionNotFound(`session "${sessionId}" not found`)
+      }
+    }
+    if (attached !== undefined
+      && !principalOwns(requestPrincipalOf(this.ctx), attached.header.ownerUserId)) {
+      throw new ApiSessionNotFound(`session "${sessionId}" not found`)
+    }
     if (attached !== undefined && hasApiSessionSubagentOwner(this.ctx, attached, live)) {
       throw new ApiSessionSubagentOwnership(sessionId)
     }
@@ -450,6 +492,9 @@ export class ApiSessionAgentController {
     if (checkPersistedIdentity) {
       try {
         using observation = await this.ctx.sessionQuery.observeSession(sessionId)
+        if (!principalOwns(requestPrincipalOf(this.ctx), observation.header.ownerUserId)) {
+          throw new ApiSessionNotFound(`session "${sessionId}" not found`)
+        }
         if (hasApiSessionSubagentOwner(this.ctx, { header: observation.header }, undefined)) {
           throw new ApiSessionSubagentOwnership(sessionId)
         }
@@ -481,6 +526,7 @@ export class ApiSessionAgentController {
       agentOptions: this.agentOptions(),
       meta: {
         cwd,
+        ...(ownerUserId === undefined ? {} : { ownerUserId }),
         ...(composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset }),
       },
       setup: composition.setup,

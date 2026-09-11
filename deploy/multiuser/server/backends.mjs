@@ -26,7 +26,10 @@ function portOpen(port) {
 }
 
 function launchToken(userId, logRoot = LOG_ROOT) {
-  const path = `${logRoot}/${userId}/web.log`
+  return launchTokenFromPath(`${logRoot}/${userId}/web.log`)
+}
+
+function launchTokenFromPath(path) {
   if (!existsSync(path)) return undefined
   const stats = statSync(path)
   const length = Math.min(stats.size, 131072)
@@ -63,8 +66,8 @@ function establishedPorts() {
   return ports
 }
 
-async function bootstrapCookie(port, publicHost, userId, logRoot = LOG_ROOT) {
-  const token = launchToken(userId, logRoot)
+async function bootstrapCookie(port, publicHost, userId, logRoot = LOG_ROOT, explicitToken) {
+  const token = explicitToken ?? launchToken(userId, logRoot)
   if (token === undefined) throw new Error(`launch token unavailable for ${userId}`)
   return new Promise((resolve, reject) => {
     const request = http.request({
@@ -275,4 +278,147 @@ export class BackendManager {
       state.lastUsed = now
     }
   }
+}
+
+/** One shared Harness process adopted by every authenticated principal. */
+export class SharedBackendManager {
+  constructor(config, logger, options = {}) {
+    this.config = config
+    this.logger = logger
+    this.portOpen = options.portOpen ?? portOpen
+    this.readLaunchToken = options.launchToken
+      ?? (() => launchTokenFromPath(config.sharedHarness.logPath))
+    this.bootstrapCookie = options.bootstrapCookie
+      ?? (() => bootstrapCookieFromPath(
+        config.sharedHarness.port,
+        config.publicHost,
+        config.sharedHarness.logPath,
+      ))
+    this.execFile = options.execFile ?? execFileAsync
+    this.state = {
+      user: { id: 'shared', port: config.sharedHarness.port, enabled: true },
+      port: config.sharedHarness.port,
+      cookie: undefined,
+      lastUsed: Date.now(),
+      refreshing: undefined,
+      starting: undefined,
+      stopping: false,
+    }
+  }
+
+  markUsed() {
+    this.state.lastUsed = Date.now()
+  }
+
+  async ensure(_userId, traceId) {
+    this.markUsed()
+    if (await this.portOpen(this.config.sharedHarness.port)) {
+      if (this.state.cookie === undefined) await this.refreshCookie(traceId)
+      return this.state
+    }
+    if (this.state.starting === undefined) {
+      this.state.starting = this.start(traceId).finally(() => {
+        this.state.starting = undefined
+      })
+    }
+    await this.state.starting
+    return this.state
+  }
+
+  async refreshCookie(traceId) {
+    if (this.state.refreshing === undefined) {
+      this.state.refreshing = this.refreshCookieInternal(traceId).finally(() => {
+        this.state.refreshing = undefined
+      })
+    }
+    await this.state.refreshing
+    return this.state
+  }
+
+  async refreshCookieInternal(traceId) {
+    if (this.readLaunchToken() !== undefined) {
+      try {
+        this.state.cookie = await this.bootstrapCookie()
+        return
+      } catch (error) {
+        this.logger.warn('retry_scheduled', {
+          traceId,
+          job: 'shared_cookie_refresh',
+          error_type: error?.name ?? 'Error',
+          reason: 'launch_token_bootstrap_failed',
+        })
+      }
+    }
+    await this.bootstrapService(traceId, 'restart', 'launch_token_unavailable')
+  }
+
+  async start(traceId) {
+    await this.bootstrapService(traceId, 'start', 'shared_backend_missing')
+  }
+
+  async bootstrapService(traceId, action, reason) {
+    const service = this.config.sharedHarness.service
+    this.logger.info('job_started', {
+      traceId, job: 'shared_backend_start', service, reason,
+    })
+    try {
+      await this.execFile('/usr/bin/systemctl', ['--user', action, service])
+      this.state.cookie = undefined
+      const startedAt = Date.now()
+      this.state.cookie = await this.waitForBootstrap(traceId, this.config.startTimeoutMs)
+      this.logger.info('job_succeeded', {
+        traceId, job: 'shared_backend_start', service,
+        duration_ms: Date.now() - startedAt,
+      })
+    } catch (error) {
+      this.logger.error('job_failed', {
+        traceId, job: 'shared_backend_start', service,
+        error_type: error?.name ?? 'Error',
+        reason: 'shared_backend_start_failed',
+      })
+      throw error
+    }
+  }
+
+  async waitForBootstrap(traceId, timeoutMs) {
+    const deadline = Date.now() + timeoutMs
+    let lastError
+    while (Date.now() < deadline) {
+      if (await this.portOpen(this.config.sharedHarness.port)
+        && this.readLaunchToken() !== undefined) {
+        try {
+          return await this.bootstrapCookie()
+        } catch (error) {
+          lastError = error
+        }
+      }
+      await sleep(500)
+    }
+    this.logger.warn('retry_scheduled', {
+      traceId,
+      job: 'shared_backend_start',
+      error_type: lastError?.name ?? 'TimeoutError',
+      reason: 'shared_backend_cookie_wait_timeout',
+    })
+    throw lastError ?? new Error('shared Harness did not become ready')
+  }
+
+  /** Shared residency is intentional; per-user idle reaping does not stop it. */
+  async reapIdle() {}
+
+  async stop(reason, traceId) {
+    await this.execFile('/usr/bin/systemctl', [
+      '--user', 'stop', this.config.sharedHarness.service,
+    ])
+    this.state.cookie = undefined
+    this.logger.info('system_stopped', {
+      traceId, service: this.config.sharedHarness.service, reason,
+    })
+  }
+}
+
+function bootstrapCookieFromPath(port, publicHost, path) {
+  const token = launchTokenFromPath(path)
+  if (token === undefined) throw new Error('shared Harness launch token unavailable')
+  return bootstrapCookie(port, publicHost, 'shared', undefined, token)
 }

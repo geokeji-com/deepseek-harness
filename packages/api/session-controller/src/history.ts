@@ -34,6 +34,7 @@ import type {
   SessionWireEvent,
 } from './types.ts'
 import { SessionAssistantStreamAccumulator } from './assistant-stream.ts'
+import { principalOwns, requestPrincipalOf } from './authorization.ts'
 
 const DEFAULT_MAX_MESSAGES = 50
 const MESSAGE_TYPES = new Set(['user/message', 'assistant/message'])
@@ -250,6 +251,10 @@ export class SessionHistoryController {
         signal,
         projectionMode: withProjections || address.kind === 'subagent' ? 'all' : 'none',
       })
+      if (!principalOwns(requestPrincipalOf(this.ctx), observation.header.ownerUserId)) {
+        observation[Symbol.dispose]()
+        rejectNotFound(address)
+      }
       if (observation.header.cwd === undefined) {
         observation[Symbol.dispose]()
         rejectNotFound(address)

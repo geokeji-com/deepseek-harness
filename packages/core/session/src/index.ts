@@ -103,6 +103,10 @@ function validateSessionHeader(id: SessionId, input: unknown): SessionHeader {
   if (record.id !== id) {
     throw new Error(`session header id "${String(record.id)}" does not match session id "${id}"`)
   }
+  if (record.ownerUserId !== undefined
+    && (typeof record.ownerUserId !== 'string' || record.ownerUserId.length === 0)) {
+    throw new Error('session header ownerUserId must be a non-empty string')
+  }
   if (typeof record.createdAt !== 'number'
     || !Number.isSafeInteger(record.createdAt)
     || record.createdAt < 0) {
@@ -1000,6 +1004,7 @@ export class SessionStore extends Service {
       version: SESSION_FORMAT_VERSION,
       id: sessionId,
       createdAt: meta?.createdAt ?? Date.now(),
+      ...meta?.ownerUserId === undefined ? {} : { ownerUserId: meta.ownerUserId },
       ...meta?.cwd === undefined ? {} : { cwd: meta.cwd },
       ...meta?.parentSession === undefined ? {} : { parentSession: meta.parentSession },
       isSeeded: meta?.isSeeded ?? false,
