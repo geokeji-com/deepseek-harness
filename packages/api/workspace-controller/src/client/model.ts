@@ -27,7 +27,7 @@ export type WorkspaceListPhase = 'pending' | 'ready'
 /** Immutable Client Workspace state. */
 export interface WorkspaceSnapshot {
   readonly items: readonly WorkspaceView[]
-  /** Complete registry-global archive set in Host order. */
+  /** Complete caller-visible archive set in Host order. */
   readonly archivedSessionIds: WorkspaceArchiveValue['archivedSessionIds']
   readonly state: 'idle' | 'loading' | 'error'
   readonly phase: WorkspaceListPhase

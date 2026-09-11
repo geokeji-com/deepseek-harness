@@ -8,6 +8,7 @@
   "files": [
     "src/index.ts",
     "src/types.ts",
+    "src/authorization.ts",
     "src/commands.ts",
     "src/directory-picker.ts",
     "src/feed.ts"

@@ -3,11 +3,9 @@
 import type { Context } from '@deepseek-ai/cordis'
 import {
   currentRequestPrincipal,
-  requestPrincipalOwns,
   type RequestPrincipal,
 } from '@deepseek-ai/dsh-client-connection'
 import { Deque } from '@deepseek-ai/dsh-deque'
-import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { DomainChanged } from '@deepseek-ai/dsh-storage-domain'
 import type { Workspace, WorkspaceRecord } from '@deepseek-ai/dsh-workspace'
 import {
@@ -20,6 +18,7 @@ import type {
   WorkspaceFollowFrame,
   WorkspaceView,
 } from './types.ts'
+import { WorkspaceAccess } from './authorization.ts'
 
 /**
  * Project one authoritative Workspace entity into its Remote value.
@@ -60,8 +59,14 @@ export class WorkspaceFeed {
   private order: readonly string[]
   private archived: readonly string[]
 
-  /** @param ctx - Host context containing the authoritative Workspace registry. */
-  constructor(private readonly ctx: Context) {
+  /**
+   * @param ctx - Host context containing the authoritative Workspace registry.
+   * @param ownerWorkspaceRoot - team Workspace root containing member directories.
+   */
+  constructor(
+    private readonly ctx: Context,
+    private readonly ownerWorkspaceRoot?: string,
+  ) {
     const baseline = ctx.workspaceRegistry.list()
     this.knownIds = new Set(baseline.map(workspace => String(workspace.id)))
     this.order = baseline.map(workspace => String(workspace.id))
@@ -78,13 +83,13 @@ export class WorkspaceFeed {
    * @returns all active Workspaces and archived Session identities.
    */
   baseline(principal?: RequestPrincipal): WorkspaceBaseline {
-    const visible = (sessionId: string): boolean => requestPrincipalOwns(
-      principal,
-      this.ctx.workspaceRegistry.sessionHeader(sessionId as SessionId)?.ownerUserId,
-    )
+    const access = new WorkspaceAccess(this.ctx, this.ownerWorkspaceRoot, principal)
     return {
-      items: this.ctx.workspaceRegistry.list().map(workspace => workspaceView(workspace, visible)),
-      archivedSessionIds: this.ctx.workspaceRegistry.archivedSessionIds.filter(visible),
+      items: this.ctx.workspaceRegistry.list()
+        .filter(workspace => access.workspace(workspace))
+        .map(workspace => workspaceView(workspace, sessionId => access.session(sessionId))),
+      archivedSessionIds: this.ctx.workspaceRegistry.archivedSessionIds
+        .filter(sessionId => access.session(sessionId)),
     }
   }
 
@@ -96,10 +101,14 @@ export class WorkspaceFeed {
   async *follow(signal: AbortSignal): AsyncIterable<WorkspaceFollowFrame> {
     signal.throwIfAborted()
     const principal = currentRequestPrincipal(this.ctx)
-    const follower = new WorkspaceFollower(sessionId => requestPrincipalOwns(
-      principal,
-      this.ctx.workspaceRegistry.sessionHeader(sessionId as SessionId)?.ownerUserId,
-    ))
+    const access = new WorkspaceAccess(this.ctx, this.ownerWorkspaceRoot, principal)
+    const initialWorkspaces = this.ctx.workspaceRegistry.list()
+    const follower = new WorkspaceFollower(
+      access,
+      initialWorkspaces
+        .filter(workspace => access.workspace(workspace))
+        .map(workspace => String(workspace.id)),
+    )
     this.followers.add(follower)
     try {
       yield { type: 'baseline', value: this.baseline(principal) }
@@ -159,34 +168,64 @@ function sameStrings(left: readonly string[], right: readonly string[]): boolean
 
 class WorkspaceFollower {
   private readonly frames = new Deque<WorkspaceFollowFrame>()
+  private readonly visibleWorkspaceIds: Set<string>
+  private visibleOrder: string[]
   private waiting: (() => void) | undefined
   private closed = false
 
   constructor(
-    private readonly visible: (sessionId: string) => boolean,
-  ) {}
+    private readonly access: WorkspaceAccess,
+    visibleWorkspaceIds: readonly string[],
+  ) {
+    this.visibleWorkspaceIds = new Set(visibleWorkspaceIds)
+    this.visibleOrder = [...visibleWorkspaceIds]
+  }
 
   push(frame: WorkspaceFollowFrame): void {
     /* v8 ignore next -- closed followers are removed before later publication can reach them. */
     if (this.closed) return
-    this.frames.pushBack(this.project(frame))
+    const projected = this.project(frame)
+    if (projected === undefined) return
+    this.frames.pushBack(projected)
     this.waiting?.()
   }
 
-  private project(frame: WorkspaceFollowFrame): WorkspaceFollowFrame {
+  private project(frame: WorkspaceFollowFrame): WorkspaceFollowFrame | undefined {
     if (frame.type === 'upsert') {
+      if (!this.access.workspace(frame.workspace)) {
+        const workspaceId = String(frame.workspace.workspaceId)
+        if (!this.visibleWorkspaceIds.delete(workspaceId)) return undefined
+        this.visibleOrder = this.visibleOrder.filter(id => id !== workspaceId)
+        return { type: 'remove', workspaceId: frame.workspace.workspaceId }
+      }
+      this.visibleWorkspaceIds.add(String(frame.workspace.workspaceId))
       return {
         ...frame,
         workspace: {
           ...frame.workspace,
-          sessionIds: frame.workspace.sessionIds.filter(this.visible),
+          sessionIds: frame.workspace.sessionIds
+            .filter(sessionId => this.access.session(sessionId)),
         },
       }
+    }
+    if (frame.type === 'remove') {
+      const workspaceId = String(frame.workspaceId)
+      if (!this.visibleWorkspaceIds.delete(workspaceId)) return undefined
+      this.visibleOrder = this.visibleOrder.filter(id => id !== workspaceId)
+      return frame
+    }
+    if (frame.type === 'order') {
+      const workspaceIds = frame.workspaceIds
+        .filter(workspaceId => this.visibleWorkspaceIds.has(String(workspaceId)))
+      if (sameStrings(this.visibleOrder, workspaceIds.map(String))) return undefined
+      this.visibleOrder = workspaceIds.map(String)
+      return { type: 'order', workspaceIds }
     }
     if (frame.type === 'archived') {
       return {
         ...frame,
-        archivedSessionIds: frame.archivedSessionIds.filter(this.visible),
+        archivedSessionIds: frame.archivedSessionIds
+          .filter(sessionId => this.access.session(sessionId)),
       }
     }
     return frame

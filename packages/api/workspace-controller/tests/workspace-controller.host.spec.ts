@@ -42,7 +42,9 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve }
 }
 
-async function harness() {
+async function harness(config: {
+  readonly ownerWorkspaceRoot?: string | true
+} = {}) {
   const root = realpathSync.native(mkdtempSync(join(tmpdir(), 'dsh-workspace-controller-')))
   tempDirs.push(root)
   const ctx = new Context()
@@ -60,7 +62,13 @@ async function harness() {
     lookups: { configure: () => dispose },
     contexts: { configureHost: () => dispose },
   } as never)
-  const controller = new WorkspaceController(ctx)
+  const ownerWorkspaceRoot = config.ownerWorkspaceRoot === true
+    ? join(root, 'team')
+    : config.ownerWorkspaceRoot
+  const controller = new WorkspaceController(
+    ctx,
+    ownerWorkspaceRoot === undefined ? {} : { ownerWorkspaceRoot },
+  )
   return { controller, ctx, root, storageDomain }
 }
 
@@ -79,9 +87,121 @@ async function nextFrame(
 }
 
 describe('WorkspaceController commands', () => {
-  it('filters Workspace Session membership and rejects another owner mutations', async () => {
-    const { controller, ctx, root } = await harness()
-    const workspace = await controller.create({ path: stageDir(root, 'shared') })
+  it('shows only the principal member Workspace and rejects foreign mutations', async () => {
+    const { controller, ctx, root } = await harness({ ownerWorkspaceRoot: true })
+    const principalService = new RequestPrincipalService(ctx, {
+      secret: 'workspace-member-isolation-secret-0123456789',
+    })
+    const principalA = {
+      userId: toUserId('member-a'),
+      issuedAt: 1,
+      expiresAt: Number.MAX_SAFE_INTEGER,
+    }
+    const principalB = {
+      userId: toUserId('member-b'),
+      issuedAt: 1,
+      expiresAt: Number.MAX_SAFE_INTEGER,
+    }
+    const workspaceA = await principalService.run(principalA, () => controller.create({
+      path: stageDir(root, 'team/member-a'),
+    }))
+    const workspaceB = await principalService.run(principalB, () => controller.create({
+      path: stageDir(root, 'team/member-b/project-b'),
+    }))
+    const sessionA = ctx.sessions.create(SessionId('workspace-member-a-session'), {
+      meta: { cwd: workspaceA.workspace.path, ownerUserId: 'member-a' },
+    })
+    const registryA = ctx.workspaceRegistry.get(workspaceA.workspace.workspaceId)
+    if (registryA === undefined) throw new Error('fixture Workspace A disappeared')
+    await registryA.attachSession(sessionA.id)
+
+    await expect(principalService.run(principalA, () => controller.create({
+      path: workspaceB.workspace.path,
+    }))).rejects.toMatchObject({ code: 'workspace/invalid-path' })
+    await expect(principalService.run(principalA, () => controller.create({
+      path: stageDir(root, 'team/member-a2/project'),
+    }))).rejects.toMatchObject({ code: 'workspace/invalid-path' })
+
+    const privateTitle = 'member-b-private'
+    await principalService.run(principalB, () => controller.rename({
+      workspaceId: workspaceB.workspace.workspaceId,
+      title: privateTitle,
+    }))
+    await principalService.run(principalA, () => controller.rename({
+      workspaceId: workspaceA.workspace.workspaceId,
+      title: privateTitle,
+    }))
+    await expect(principalService.run(principalA, () => controller.rename({
+      workspaceId: workspaceB.workspace.workspaceId,
+      title: 'foreign-rename',
+    }))).rejects.toMatchObject({ code: 'workspace/not-found' })
+    await expect(principalService.run(principalA, () => controller.delete({
+      workspaceId: workspaceB.workspace.workspaceId,
+    }))).rejects.toMatchObject({ code: 'workspace/not-found' })
+    await expect(principalService.run(principalA, () => controller.insertBefore({
+      workspaceId: workspaceB.workspace.workspaceId,
+    }))).rejects.toMatchObject({ code: 'workspace/not-found' })
+    await expect(principalService.run(principalA, () => controller.insertBefore({
+      workspaceId: workspaceA.workspace.workspaceId,
+      beforeWorkspaceId: workspaceB.workspace.workspaceId,
+    }))).rejects.toMatchObject({ code: 'workspace/not-found' })
+    await expect(principalService.run(principalA, () => controller.insertSessionBefore({
+      workspaceId: workspaceB.workspace.workspaceId,
+      sessionId: sessionA.id,
+    }))).rejects.toMatchObject({ code: 'workspace/not-found' })
+
+    const abort = new AbortController()
+    const iterator = principalService.bindIterable(principalA, controller.follow(abort.signal))
+      [Symbol.asyncIterator]()
+    const baseline = await nextFrame(iterator)
+    expect(baseline).toMatchObject({
+      type: 'baseline',
+      value: {
+        items: [{
+          workspaceId: workspaceA.workspace.workspaceId,
+          path: workspaceA.workspace.path,
+          title: privateTitle,
+          sessionIds: [sessionA.id],
+        }],
+        archivedSessionIds: [],
+      },
+    })
+    const foreignUpdate = 'member-b-updated'
+    await principalService.run(principalB, () => controller.rename({
+      workspaceId: workspaceB.workspace.workspaceId,
+      title: foreignUpdate,
+    }))
+    const workspaceA2 = await principalService.run(principalA, () => controller.create({
+      path: stageDir(root, 'team/member-a/project-a2'),
+    }))
+    const upsert = await nextFrame(iterator)
+    expect(upsert).toMatchObject({
+      type: 'upsert',
+      workspace: {
+        workspaceId: workspaceA2.workspace.workspaceId,
+      },
+    })
+    const order = await nextFrame(iterator)
+    if (order.type !== 'order') throw new Error('expected a Workspace order frame')
+    expect(order).toEqual({
+      type: 'order',
+      workspaceIds: [
+        workspaceA2.workspace.workspaceId,
+        workspaceA.workspace.workspaceId,
+      ],
+    })
+    expect(order.workspaceIds).not.toContain(workspaceB.workspace.workspaceId)
+    expect(JSON.stringify([baseline, upsert, order])).not.toContain(workspaceB.workspace.workspaceId)
+    expect(JSON.stringify([baseline, upsert, order])).not.toContain(workspaceB.workspace.path)
+    expect(JSON.stringify([baseline, upsert, order])).not.toContain(foreignUpdate)
+
+    abort.abort()
+    await iterator.next()
+  })
+
+  it('filters Workspace Session membership and hides the Workspace from another owner', async () => {
+    const { controller, ctx, root } = await harness({ ownerWorkspaceRoot: true })
+    const workspace = await controller.create({ path: stageDir(root, 'team/member-a/shared') })
     const memberA = ctx.sessions.create(SessionId('workspace-owned-a'), {
       meta: { cwd: workspace.workspace.path, ownerUserId: 'member-a' },
     })
@@ -117,15 +237,11 @@ describe('WorkspaceController commands', () => {
     await expect(principals.run(principalB, () => controller.rename({
       workspaceId: workspace.workspace.workspaceId,
       title: 'visible to b',
-    }))).resolves.toMatchObject({
-      workspace: {
-        sessionIds: [memberB.id],
-      },
-    })
+    }))).rejects.toMatchObject({ code: 'workspace/not-found' })
     await expect(principals.run(principalB, () => controller.insertSessionBefore({
       workspaceId: workspace.workspace.workspaceId,
       sessionId: memberA.id,
-    }))).rejects.toMatchObject({ code: 'session/not-found' })
+    }))).rejects.toMatchObject({ code: 'workspace/not-found' })
     await expect(principals.run(principalB, () => controller.archiveSession({
       sessionId: memberA.id,
     }))).rejects.toMatchObject({ code: 'session/not-found' })
@@ -138,10 +254,7 @@ describe('WorkspaceController commands', () => {
       value: {
         type: 'baseline',
         value: {
-          items: [{
-            workspaceId: workspace.workspace.workspaceId,
-            sessionIds: [memberB.id],
-          }],
+          items: [],
           archivedSessionIds: [],
         },
       },

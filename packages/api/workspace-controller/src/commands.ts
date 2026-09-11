@@ -9,12 +9,14 @@ import {
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { Workspace } from '@deepseek-ai/dsh-workspace'
 import {
+  realpathNormalize,
   WorkspaceId,
   WorkspaceMoveInvalidError,
   WorkspaceOrderInvalidError,
   WorkspaceUnknownSessionError,
 } from '@deepseek-ai/dsh-workspace'
 import { RemoteError, remoteErrorOf } from '@deepseek-ai/dsh-typert-protocol'
+import { WorkspaceAccess, workspacePathVisible } from './authorization.ts'
 import { workspaceView } from './feed.ts'
 import type {
   WorkspaceArchiveSessionRequest,
@@ -34,8 +36,14 @@ import type {
 export class WorkspaceCommands {
   private operationTail = Promise.resolve()
 
-  /** @param ctx - Host context containing the Workspace registry. */
-  constructor(private readonly ctx: Context) {}
+  /**
+   * @param ctx - Host context containing the Workspace registry.
+   * @param ownerWorkspaceRoot - team Workspace root containing member directories.
+   */
+  constructor(
+    private readonly ctx: Context,
+    private readonly ownerWorkspaceRoot?: string,
+  ) {}
 
   /**
    * Create or resolve one Workspace over an existing directory.
@@ -46,12 +54,27 @@ export class WorkspaceCommands {
     const principal = currentRequestPrincipal(this.ctx)
     return this.enqueue(async () => {
       try {
-        const existing = await this.ctx.workspaceRegistry.resolveByPath(request.path)
-        if (existing !== undefined) {
-          return { workspace: workspaceView(existing, this.visible(principal)), created: false }
+        if (!workspacePathVisible(principal, this.ownerWorkspaceRoot, request.path)) {
+          throw invalidWorkspacePath(request.path)
         }
-        const workspace = await this.ctx.workspaceRegistry.create(request.path)
-        return { workspace: workspaceView(workspace, this.visible(principal)), created: true }
+        const canonical = await realpathNormalize(request.path)
+        if (!workspacePathVisible(principal, this.ownerWorkspaceRoot, canonical)) {
+          throw invalidWorkspacePath(request.path)
+        }
+        const existing = await this.ctx.workspaceRegistry.resolveByPath(canonical)
+        if (existing !== undefined) {
+          const access = this.access(principal)
+          return {
+            workspace: workspaceView(existing, sessionId => access.session(sessionId)),
+            created: false,
+          }
+        }
+        const workspace = await this.ctx.workspaceRegistry.create(canonical)
+        const access = this.access(principal)
+        return {
+          workspace: workspaceView(workspace, sessionId => access.session(sessionId)),
+          created: true,
+        }
       } catch (error) {
         if (remoteErrorOf(error) !== undefined) throw error
         throw new RemoteError(
@@ -75,11 +98,14 @@ export class WorkspaceCommands {
       return Promise.reject(new RemoteError('gateway/bad-request', 'Workspace rename requires a non-blank title', {}))
     }
     const principal = currentRequestPrincipal(this.ctx)
+    const access = this.access(principal)
     return this.enqueue(async () => {
-      const workspace = this.requireWorkspace(request.workspaceId)
+      const workspace = this.requireWorkspace(request.workspaceId, access)
       if (title !== workspace.title) {
         if (this.ctx.workspaceRegistry.list().some(candidate =>
-          candidate.id !== workspace.id && candidate.title === title)) {
+          candidate.id !== workspace.id
+          && access.workspace(candidate)
+          && candidate.title === title)) {
           throw new RemoteError(
             'workspace/name-conflict',
             `Workspace name '${title}' is already in use`,
@@ -88,7 +114,7 @@ export class WorkspaceCommands {
         }
         await workspace.setTitle(title)
       }
-      return { workspace: workspaceView(workspace, this.visible(principal)) }
+      return { workspace: workspaceView(workspace, sessionId => access.session(sessionId)) }
     })
   }
 
@@ -98,7 +124,9 @@ export class WorkspaceCommands {
    * @returns deletion confirmation.
    */
   delete(request: WorkspaceDeleteRequest): Promise<WorkspaceDeleteValue> {
+    const access = this.access(currentRequestPrincipal(this.ctx))
     return this.enqueue(async () => {
+      this.requireWorkspace(request.workspaceId, access)
       if (!await this.ctx.workspaceRegistry.delete(WorkspaceId(request.workspaceId))) {
         throw workspaceNotFound(request.workspaceId)
       }
@@ -109,9 +137,14 @@ export class WorkspaceCommands {
   /**
    * Move one Workspace within the durable registry order.
    * @param request - moved Workspace and optional anchor.
-   * @returns the complete resulting Workspace order.
+   * @returns the complete caller-visible Workspace order.
    */
   async insertBefore(request: WorkspaceInsertBeforeRequest): Promise<WorkspaceOrderValue> {
+    const access = this.access(currentRequestPrincipal(this.ctx))
+    this.requireWorkspace(request.workspaceId, access)
+    if (request.beforeWorkspaceId !== undefined) {
+      this.requireWorkspace(request.beforeWorkspaceId, access)
+    }
     try {
       const workspaceIds = await this.ctx.workspaceRegistry.insertBefore(
         WorkspaceId(request.workspaceId),
@@ -119,7 +152,12 @@ export class WorkspaceCommands {
           ? undefined
           : WorkspaceId(request.beforeWorkspaceId),
       )
-      return { workspaceIds: [...workspaceIds] }
+      return {
+        workspaceIds: workspaceIds.filter((workspaceId) => {
+          const workspace = this.ctx.workspaceRegistry.get(workspaceId)
+          return workspace !== undefined && access.workspace(workspace)
+        }),
+      }
     } catch (error) {
       if (!(error instanceof WorkspaceOrderInvalidError)) throw error
       throw workspaceNotFound(error.workspaceId)
@@ -133,7 +171,8 @@ export class WorkspaceCommands {
    */
   async insertSessionBefore(request: WorkspaceInsertSessionBeforeRequest): Promise<WorkspaceValue> {
     const principal = currentRequestPrincipal(this.ctx)
-    const workspace = this.requireWorkspace(request.workspaceId)
+    const access = this.access(principal)
+    const workspace = this.requireWorkspace(request.workspaceId, access)
     this.requireOwnedSession(request.sessionId, principal)
     if (request.beforeSessionId !== undefined) {
       this.requireOwnedSession(request.beforeSessionId, principal)
@@ -155,7 +194,7 @@ export class WorkspaceCommands {
         { cause: error },
       )
     }
-    return { workspace: workspaceView(workspace, this.visible(principal)) }
+    return { workspace: workspaceView(workspace, sessionId => access.session(sessionId)) }
   }
 
   /**
@@ -165,6 +204,7 @@ export class WorkspaceCommands {
    */
   async archiveSession(request: WorkspaceArchiveSessionRequest): Promise<WorkspaceArchiveValue> {
     const principal = currentRequestPrincipal(this.ctx)
+    const access = this.access(principal)
     this.requireOwnedSession(request.sessionId, principal)
     try {
       await this.ctx.workspaceRegistry.archiveSession(request.sessionId)
@@ -173,15 +213,13 @@ export class WorkspaceCommands {
       throw new RemoteError('session/not-found', error.message, { sessionId: request.sessionId }, { cause: error })
     }
     return {
-      archivedSessionIds: this.ctx.workspaceRegistry.archivedSessionIds.filter(this.visible(principal)),
+      archivedSessionIds: this.ctx.workspaceRegistry.archivedSessionIds
+        .filter(sessionId => access.session(sessionId)),
     }
   }
 
-  private visible(principal: RequestPrincipal | undefined): (sessionId: string) => boolean {
-    return sessionId => requestPrincipalOwns(
-      principal,
-      this.ctx.workspaceRegistry.sessionHeader(sessionId as SessionId)?.ownerUserId,
-    )
+  private access(principal: RequestPrincipal | undefined): WorkspaceAccess {
+    return new WorkspaceAccess(this.ctx, this.ownerWorkspaceRoot, principal)
   }
 
   private requireOwnedSession(
@@ -194,9 +232,11 @@ export class WorkspaceCommands {
     }
   }
 
-  private requireWorkspace(workspaceId: WorkspaceId): Workspace {
+  private requireWorkspace(workspaceId: WorkspaceId, access: WorkspaceAccess): Workspace {
     const workspace = this.ctx.workspaceRegistry.get(WorkspaceId(workspaceId))
-    if (workspace === undefined) throw workspaceNotFound(workspaceId)
+    if (workspace === undefined || !access.workspace(workspace)) {
+      throw workspaceNotFound(workspaceId)
+    }
     return workspace
   }
 
@@ -205,6 +245,14 @@ export class WorkspaceCommands {
     this.operationTail = result.then(() => undefined, () => undefined)
     return result
   }
+}
+
+function invalidWorkspacePath(path: string): RemoteError<'workspace/invalid-path'> {
+  return new RemoteError(
+    'workspace/invalid-path',
+    `cannot create a Workspace at "${path}": path is outside the caller's Workspace root`,
+    { path },
+  )
 }
 
 function workspaceNotFound(workspaceId: WorkspaceId): RemoteError<'workspace/not-found'> {

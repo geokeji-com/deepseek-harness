@@ -87,7 +87,7 @@ export interface WorkspaceInsertBeforeRequest {
   readonly beforeWorkspaceId?: WorkspaceId
 }
 
-/** Complete Workspace registry order after a mutation. */
+/** Complete caller-visible Workspace order after a mutation. */
 export interface WorkspaceOrderValue {
   readonly workspaceIds: readonly WorkspaceId[]
 }
@@ -109,7 +109,7 @@ export interface WorkspaceArchiveValue {
   readonly archivedSessionIds: readonly SessionId[]
 }
 
-/** Complete reconnect baseline for Workspace browser state. */
+/** Complete caller-visible reconnect baseline for Workspace browser state. */
 export interface WorkspaceBaseline {
   readonly items: readonly WorkspaceView[]
   readonly archivedSessionIds: readonly SessionId[]

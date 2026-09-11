@@ -4,6 +4,9 @@
 # proxy to the caller's private Workspace root.
 - id: directory-picker
   disabled: true
+- id: workspace-controller
+  config:
+    ownerWorkspaceRoot: !!js process.env.DSH_WORKSPACE ?? ''
 - insert:
     - id: directory-picker-browse
       name: '@deepseek-ai/dsh-host-directory-picker-browse'
