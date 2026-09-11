@@ -7,11 +7,11 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/home/dsh/deepseek-harness
 Environment=HOME=/home/dsh
-Environment=PATH=/home/dsh/.tools/pnpm/node_modules/.bin:/usr/bin:/bin
-Environment=NODE_OPTIONS=--max-old-space-size=4096
+Environment=PATH=/usr/bin:/bin
+Environment=NODE_OPTIONS=--max-old-space-size=1536
 EnvironmentFile=/home/dsh/.config/deepseek-harness/multiuser/shared.env
 EnvironmentFile=/home/dsh/.config/deepseek-harness/multiuser/shared-harness.env
-ExecStart=/usr/bin/node /home/dsh/.tools/pnpm/node_modules/pnpm/bin/pnpm.mjs dsh web --patch /home/dsh/deepseek-harness/deploy/multiuser/server/shared-harness.overlay.yml --no-open --host 127.0.0.1 --trusted-host 8.130.99.203 --port ${DSH_PORT}
+ExecStart=/usr/bin/node /home/dsh/deepseek-harness/apps/cli/lib/bin.js web --patch /home/dsh/deepseek-harness/deploy/multiuser/server/shared-harness.overlay.yml --no-open --host 127.0.0.1 --trusted-host 8.130.99.203 --port ${DSH_PORT}
 Restart=always
 RestartSec=3s
 TimeoutStopSec=30s
