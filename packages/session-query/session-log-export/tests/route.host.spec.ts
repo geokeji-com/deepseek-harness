@@ -1,5 +1,9 @@
+import { createHmac } from 'node:crypto'
 import { Context } from '@deepseek-ai/cordis'
-import { HostConnectionService } from '@deepseek-ai/dsh-client-connection'
+import {
+  HostConnectionService,
+  RequestPrincipalService,
+} from '@deepseek-ai/dsh-client-connection'
 import type { BrowserAuth } from '@deepseek-ai/dsh-client-connection/src/browser-auth.ts'
 import { SESSION_FORMAT_VERSION } from '@deepseek-ai/dsh-session'
 import type { SessionHeader, SessionId } from '@deepseek-ai/dsh-session'
@@ -15,8 +19,25 @@ import {
 } from '../src/index.ts'
 
 const sid = (value: string): SessionId => value as SessionId
+const SECRET = 'session-export-principal-secret-0123456789abcdef'
 
-function readHandle(id: string): SessionHandle {
+function principalToken(userId: string, url: string): string {
+  const now = Date.now()
+  const encoded = Buffer.from(JSON.stringify({
+    v: 1,
+    sub: userId,
+    iat: now,
+    exp: now + 60_000,
+    method: 'GET',
+    path: new URL(url, 'http://localhost').pathname + new URL(url, 'http://localhost').search,
+  }), 'utf8').toString('base64url')
+  const signature = createHmac('sha256', SECRET)
+    .update(`v1.${encoded}`)
+    .digest('base64url')
+  return `v1.${encoded}.${signature}`
+}
+
+function readHandle(id: string, ownerUserId?: string): SessionHandle {
   const header: SessionHeader = {
     version: SESSION_FORMAT_VERSION,
     id: sid(id),
@@ -24,6 +45,7 @@ function readHandle(id: string): SessionHandle {
     isSeeded: false,
     cwd: '/workspace',
     delegationDepth: 0,
+    ...(ownerUserId === undefined ? {} : { ownerUserId }),
   }
   return {
     id: header.id,
@@ -34,7 +56,10 @@ function readHandle(id: string): SessionHandle {
   } as unknown as SessionHandle
 }
 
-async function mounted(withServices: boolean): Promise<{
+async function mounted(
+  withServices: boolean,
+  options: { readonly ownerUserId?: string } = {},
+): Promise<{
   readonly connection: HostConnectionService
   readonly dispose: () => Promise<void>
 }> {
@@ -45,14 +70,19 @@ async function mounted(withServices: boolean): Promise<{
       traceSession: async () => ({ descendants: [] }),
     } as never)
     ctx.provide('sessionPersistence', {
-      stat: async (id: SessionId) => ({ header: readHandle(String(id)).header }),
-      open: async (id: SessionId) => readHandle(String(id)),
+      stat: async (id: SessionId) => ({
+        header: readHandle(String(id), options.ownerUserId).header,
+      }),
+      open: async (id: SessionId) => readHandle(String(id), options.ownerUserId),
     } as never)
     ctx.provide('attachments', {
       readImage: async () => { throw new Error('fixture has no images') },
     } as never)
   }
-  const connection = new HostConnectionService(ctx, [], {} as BrowserAuth)
+  const principal = options.ownerUserId === undefined
+    ? undefined
+    : new RequestPrincipalService(ctx, { secret: SECRET })
+  const connection = new HostConnectionService(ctx, [], {} as BrowserAuth, principal)
   const fiber = ctx.plugin({ inject: [...inject], apply })
   await fiber
   return { connection, dispose: () => fiber.dispose() }
@@ -93,6 +123,26 @@ describe('Session log export Fetch route', () => {
     expect((await shared.fetch(new Request(
       `http://host${SESSION_LOG_EXPORT_PATH}?sessionId=session-1`,
     ))).status).toBe(500)
+    await dispose()
+  })
+
+  it('hides a stored Session from a different required principal', async () => {
+    const { connection, dispose } = await mounted(true, { ownerUserId: 'member-a' })
+    const shared = connection.createSharedFetchHandler('/api')
+    const url = `${SESSION_LOG_EXPORT_PATH}?sessionId=session-1`
+    const owned = principalToken('member-a', url)
+    const foreign = principalToken('member-b', url)
+
+    const allowed = await shared.fetch(new Request(`http://host${url}`, {
+      headers: { 'x-dsh-request-principal': owned },
+    }))
+    expect(allowed.status).toBe(200)
+
+    const hidden = await shared.fetch(new Request(`http://host${url}`, {
+      headers: { 'x-dsh-request-principal': foreign },
+    }))
+    expect(hidden.status).toBe(404)
+
     await dispose()
   })
 

@@ -5,6 +5,7 @@ import type { CommandDefinitionId } from '@deepseek-ai/dsh-commands/brand'
 import Schema from '@deepseek-ai/schemastery'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import type {} from '@deepseek-ai/dsh-attachment'
+import type { RequestPrincipal } from '@deepseek-ai/dsh-client-connection'
 import type { CommandResult } from '@deepseek-ai/dsh-commands'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import {
@@ -60,7 +61,7 @@ interface SessionLogConnection {
       readonly path: string
       readonly methods: readonly ('GET' | 'HEAD')[]
       readonly requestBody: 'buffered'
-      readonly fetch: (request: Request) => Promise<Response>
+      readonly fetch: (request: Request, principal?: RequestPrincipal) => Promise<Response>
     }): () => Promise<void>
   }
 }
@@ -88,11 +89,12 @@ export function apply(ctx: Context, config: Config = {}): void {
     path: SESSION_LOG_EXPORT_PATH,
     methods: ['GET', 'HEAD'],
     requestBody: 'buffered',
-    fetch: async (request) => {
+    fetch: async (request, principal) => {
       const response = await sessionLogExportResponse(
         ctx,
         request,
         config.compressionLevel ?? DEFAULT_SESSION_LOG_COMPRESSION_LEVEL,
+        principal,
       )
       if (request.method === 'GET') return response
       await response.body?.cancel()
@@ -102,13 +104,14 @@ export function apply(ctx: Context, config: Config = {}): void {
 }
 
 function connectionOf(ctx: Context): SessionLogConnection {
-  return Reflect.get(ctx, 'connection') as SessionLogConnection
+  return Reflect.get(ctx, 'connection')
 }
 
 async function sessionLogExportResponse(
   ctx: Context,
   request: Request,
   compressionLevel: SessionLogCompressionLevel,
+  principal?: RequestPrincipal,
 ): Promise<Response> {
   const url = new URL(request.url)
   const query = Object.fromEntries(url.searchParams)
@@ -137,7 +140,12 @@ async function sessionLogExportResponse(
   let rootContent: string | undefined
   try {
     await flushLiveSessionLog(deps, sessionId, request.signal)
-    rootContent = await readSessionLogText(deps.sessionPersistence, sessionId, request.signal)
+    rootContent = await readSessionLogText(
+      deps.sessionPersistence,
+      sessionId,
+      request.signal,
+      principal?.userId,
+    )
     request.signal.throwIfAborted()
   } catch {
     request.signal.throwIfAborted()
@@ -157,6 +165,7 @@ async function sessionLogExportResponse(
       descendantsValue === 'true',
       compressionLevel,
       request.signal,
+      principal?.userId,
     ),
     {
       headers: {

@@ -143,12 +143,14 @@ export function serializeSessionLog(
  * @param persistence - the mounted persistence backend.
  * @param id - the session to read.
  * @param signal - optional cancellation forwarded to the open and read.
+ * @param ownerUserId - when present, require the stored Session header owner to match.
  * @returns the serialized JSONL text, or `undefined` when the session does not exist.
  */
 export async function readSessionLogText(
   persistence: SessionPersistence,
   id: SessionId,
   signal?: AbortSignal,
+  ownerUserId?: string,
 ): Promise<string | undefined> {
   const options = signal === undefined ? {} : { signal }
   let handle: SessionHandle
@@ -161,6 +163,7 @@ export async function readSessionLogText(
     throw error
   }
   try {
+    if (ownerUserId !== undefined && handle.header.ownerUserId !== ownerUserId) return undefined
     const { events } = await handle.read(0, undefined, options)
     return serializeSessionLog(handle.header, events)
   } finally {
@@ -325,6 +328,7 @@ export function sessionLogZipFilename(sessionId: string): string {
  * @param sessionId - the root session id.
  * @param includeDescendants - whether to include every subagent descendant.
  * @param signal - optional cancellation forwarded to lineage, persistence, and attachment reads.
+ * @param ownerUserId - when present, every exported Session header must match this owner.
  * @returns the export entries in zip order.
  */
 export async function* sessionLogZipEntries(
@@ -333,6 +337,7 @@ export async function* sessionLogZipEntries(
   sessionId: SessionId,
   includeDescendants: boolean,
   signal?: AbortSignal,
+  ownerUserId?: string,
 ): AsyncGenerator<SessionLogZipEntry> {
   const media = new Map<string, ImageAttachmentRef>()
   const files = new Map<string, FileAttachmentRef>()
@@ -354,7 +359,12 @@ export async function* sessionLogZipEntries(
         if (seen.has(id)) continue
         seen.add(id)
         await flushLiveSessionLog(deps, id, signal)
-        const content = await readSessionLogText(deps.sessionPersistence, id, signal)
+        const content = await readSessionLogText(
+          deps.sessionPersistence,
+          id,
+          signal,
+          ownerUserId,
+        )
         signal?.throwIfAborted()
         if (content === undefined) {
           throw new Error(`subagent "${id}" has no stored log`)
@@ -523,6 +533,7 @@ async function pushArtifactChunks(
  * @param includeDescendants - whether to include every subagent descendant.
  * @param compressionLevel - validated fflate DEFLATE level for every ZIP entry.
  * @param signal - request cancellation combined with response-consumer cancellation.
+ * @param ownerUserId - when present, every exported Session header must match this owner.
  * @returns the zip byte stream.
  */
 export function streamSessionLogZip(
@@ -532,6 +543,7 @@ export function streamSessionLogZip(
   includeDescendants: boolean,
   compressionLevel: SessionLogCompressionLevel,
   signal: AbortSignal,
+  ownerUserId?: string,
 ): ReadableStream<Uint8Array> {
   const consumerAbort = new AbortController()
   const producerSignal = AbortSignal.any([signal, consumerAbort.signal])
@@ -562,7 +574,14 @@ export function streamSessionLogZip(
       zip = archive
       void (async () => {
         try {
-          for await (const entry of sessionLogZipEntries(deps, rootContent, sessionId, includeDescendants, producerSignal)) {
+          for await (const entry of sessionLogZipEntries(
+            deps,
+            rootContent,
+            sessionId,
+            includeDescendants,
+            producerSignal,
+            ownerUserId,
+          )) {
             const deflate = new ZipDeflate(entry.path, { level: compressionLevel })
             archive.add(deflate)
             if ('content' in entry) {
